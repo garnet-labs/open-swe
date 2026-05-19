@@ -1,0 +1,29 @@
+name: Garnet CI
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '30 9 * * *'
+
+permissions:
+  contents: read
+
+jobs:
+  garnet-monitor:
+    name: Dependency Install (Garnet)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Garnet Runtime Visibility
+        uses: garnet-org/action@v2
+        with:
+          api_token: ${{ secrets.GARNET_API_TOKEN }}
+          jibril_version: v2.10.9
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+      - name: Sync dependencies
+        run: uv sync --all-extras
+        continue-on-error: true
+      - name: Show installed
+        run: uv pip list | head -60 || true
+        continue-on-error: true
