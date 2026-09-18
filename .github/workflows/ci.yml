@@ -52,6 +52,9 @@ jobs:
     needs: e2e-changes
     if: ${{ needs.e2e-changes.outputs.agent_unit_tests == 'true' }}
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
     services:
       postgres:
         image: postgres:16
@@ -68,6 +71,7 @@ jobs:
       TEST_ANALYTICS_POSTGRES_URI: postgresql+asyncpg://postgres:postgres@localhost:5432/postgres
     steps:
       - uses: actions/checkout@v7.0.1
+      - uses: garnet-org/action@e546567a72e4fede11ec39d6e9f75b539adef22c # main 2026-09-04
       - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
       - name: Install dependencies
         run: uv sync --locked --extra dev
