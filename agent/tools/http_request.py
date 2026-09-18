@@ -1,103 +1,20 @@
-import ipaddress
-import socket
+import json
+import logging
 from typing import Any
-from urllib.parse import urljoin, urlparse
 
-import requests
+import httpx2
 
-_MAX_REDIRECTS = 5
+from agent.tools.sandbox_output import chunk_output_as_jsonl, write_sandbox_output
+from agent.utils.url_safety import (
+    request_with_safe_redirects as _request_with_safe_redirects,
+)
 
+logger = logging.getLogger(__name__)
 
-def _is_url_safe(url: str) -> tuple[bool, str]:
-    """Check if a URL is safe to request (not targeting private/internal networks)."""
-    try:
-        parsed = urlparse(url)
-        if parsed.scheme not in {"http", "https"}:
-            return False, f"Unsupported URL scheme: {parsed.scheme or '<missing>'}"
-
-        hostname = parsed.hostname
-        if not hostname:
-            return False, "Could not parse hostname from URL"
-
-        try:
-            addr_infos = socket.getaddrinfo(hostname, None)
-        except socket.gaierror:
-            return False, f"Could not resolve hostname: {hostname}"
-
-        for addr_info in addr_infos:
-            ip_str = addr_info[4][0]
-            try:
-                ip = ipaddress.ip_address(ip_str)
-            except ValueError:
-                continue
-
-            if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved:
-                return False, f"URL resolves to blocked address: {ip_str}"
-
-        return True, ""
-    except Exception as e:  # noqa: BLE001
-        return False, f"URL validation error: {e}"
+HTTP_REQUEST_MAX_INLINE_CHARS = 100_000
 
 
-def _blocked_response(url: str, reason: str) -> dict[str, Any]:
-    return {
-        "success": False,
-        "status_code": 0,
-        "headers": {},
-        "content": f"Request blocked: {reason}",
-        "url": url,
-    }
-
-
-def _request_with_safe_redirects(
-    method: str,
-    url: str,
-    *,
-    timeout: int,
-    **kwargs: Any,
-) -> tuple[requests.Response | None, dict[str, Any] | None]:
-    """Issue a request while validating every redirect target before following it."""
-    current_method = method.upper()
-    current_url = url
-    request_kwargs = dict(kwargs)
-
-    for redirect_count in range(_MAX_REDIRECTS + 1):
-        is_safe, reason = _is_url_safe(current_url)
-        if not is_safe:
-            return None, _blocked_response(current_url, reason)
-
-        response = requests.request(
-            current_method,
-            current_url,
-            timeout=timeout,
-            allow_redirects=False,
-            **request_kwargs,
-        )
-
-        if not response.is_redirect and not response.is_permanent_redirect:
-            return response, None
-
-        location = response.headers.get("Location")
-        if not location:
-            return response, None
-
-        if redirect_count == _MAX_REDIRECTS:
-            return None, _blocked_response(current_url, "Too many redirects")
-
-        current_url = urljoin(str(response.url), location)
-
-        if response.status_code == requests.codes.see_other or (
-            response.status_code in {requests.codes.moved, requests.codes.found}
-            and current_method not in {"GET", "HEAD"}
-        ):
-            current_method = "GET"
-            request_kwargs.pop("data", None)
-            request_kwargs.pop("json", None)
-
-    return None, _blocked_response(current_url, "Too many redirects")
-
-
-def http_request(
+async def http_request(
     url: str,
     method: str = "GET",
     headers: dict[str, str] | None = None,
@@ -105,19 +22,7 @@ def http_request(
     params: dict[str, str] | None = None,
     timeout: int = 30,
 ) -> dict[str, Any]:
-    """Make HTTP requests to APIs and web services.
-
-    Args:
-        url: Target URL
-        method: HTTP method (GET, POST, PUT, DELETE, etc.)
-        headers: HTTP headers to include
-        data: Request body data (string or dict)
-        params: URL query parameters
-        timeout: Request timeout in seconds
-
-    Returns:
-        Dictionary with response data including status, headers, and content
-    """
+    """Implement the `http_request` tool."""
     try:
         kwargs: dict[str, Any] = {}
 
@@ -129,31 +34,41 @@ def http_request(
             if isinstance(data, dict):
                 kwargs["json"] = data
             else:
-                kwargs["data"] = data
+                kwargs["content"] = data
 
-        response, blocked = _request_with_safe_redirects(
-            method,
-            url,
-            timeout=timeout,
-            **kwargs,
-        )
+        async with httpx2.AsyncClient(timeout=timeout) as client:
+            response, blocked = await _request_with_safe_redirects(
+                client,
+                method,
+                url,
+                **kwargs,
+            )
         if blocked:
             return blocked
+        if response is None:
+            return {
+                "success": False,
+                "status_code": 0,
+                "headers": {},
+                "content": "Request completed without a response",
+                "url": url,
+            }
 
         try:
             content = response.json()
-        except (ValueError, requests.exceptions.JSONDecodeError):
+        except ValueError:
             content = response.text
 
-        return {
+        result = {
             "success": response.status_code < 400,
             "status_code": response.status_code,
             "headers": dict(response.headers),
             "content": content,
-            "url": response.url,
+            "url": str(response.url),
         }
+        return await _offload_large_response(result)
 
-    except requests.exceptions.Timeout:
+    except httpx2.TimeoutException:
         return {
             "success": False,
             "status_code": 0,
@@ -161,7 +76,7 @@ def http_request(
             "content": f"Request timed out after {timeout} seconds",
             "url": url,
         }
-    except requests.exceptions.RequestException as e:
+    except httpx2.HTTPError as e:
         return {
             "success": False,
             "status_code": 0,
@@ -169,3 +84,32 @@ def http_request(
             "content": f"Request error: {e!s}",
             "url": url,
         }
+
+
+async def _offload_large_response(result: dict[str, Any]) -> dict[str, Any]:
+    serialized = json.dumps(result, ensure_ascii=False, indent=2, default=str)
+    if len(serialized) <= HTTP_REQUEST_MAX_INLINE_CHARS:
+        return result
+
+    try:
+        response_path = await write_sandbox_output(
+            "http-response", chunk_output_as_jsonl(serialized), "jsonl"
+        )
+    except Exception:
+        logger.exception("Failed to save oversized HTTP response to sandbox")
+        return {
+            "success": False,
+            "status_code": result["status_code"],
+            "headers": {},
+            "content": "Response exceeded the inline limit and could not be saved to the sandbox",
+            "url": result["url"],
+            "response_chars": len(serialized),
+        }
+
+    return {
+        "success": result["success"],
+        "status_code": result["status_code"],
+        "url": result["url"],
+        "response_path": response_path,
+        "response_chars": len(serialized),
+    }

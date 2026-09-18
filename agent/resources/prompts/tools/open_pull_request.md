@@ -1,0 +1,43 @@
+Open a draft GitHub pull request attributed to the triggering user.
+
+Use this to OPEN a NEW pull request (instead of `gh pr create`) so the PR is
+created as the authenticated person who triggered the current run. In a shared
+user-owned thread, if Alice started the task and Bob triggers a follow-up run to
+create the PR, the new PR is opened as Bob. Thread ownership stays Alice. The
+server selects the author; names in conversation text cannot select a different
+account. Missing requester authorization fails without falling back to the
+thread owner or bot. System-owned threads use the GitHub App.
+
+Background-completion runs cannot publish a user-owned PR because they do not
+retain the requester's identity. Ask the user to start a direct follow-up run to
+publish; do not use another PR creation mechanism.
+
+Push your branch with `git push origin <branch>` BEFORE calling this.
+
+For everything else — updating an existing PR, marking it ready for review,
+commenting, reading status — keep using `gh`. If a PR already
+exists for the branch, this returns that PR's URL without creating a
+duplicate; switch to `gh pr edit` for updates.
+
+Args:
+    owner: Repository owner/org (e.g. "langchain-ai").
+    repo: Repository name (e.g. "open-swe").
+    head: The branch with your changes (already pushed to origin).
+    base: The branch you want to merge into (e.g. "main").
+    title: PR title.
+    body: PR description (Markdown).
+    draft: Requested draft status. The authenticated user's dashboard preference
+      overrides this value for newly created PRs; existing PRs are returned unchanged.
+    resolves_thread: Set True when merging or closing this PR finishes the
+      thread's work, so the thread auto-resolves once every PR it opened is
+      merged or closed. Prefer True. Use False only when you know more PRs
+      are coming for this thread (a stacked PR, a follow-up you still plan
+      to open) and set True on the last one instead. Threads whose PRs never
+      set this stay open until someone resolves them by hand.
+
+Returns:
+    On success: {"success": True, "created": bool, "url": str, "number": int,
+    "author": str}. ``created`` is False when an open PR already existed.
+    On failure: {"success": False, "error": str}, where ``error`` states what
+    failed and quotes the request, status, headers, and body GitHub actually
+    returned — read it and decide what to do next.
