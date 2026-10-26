@@ -6,17 +6,34 @@ from typing import Any
 
 import pytest
 
-from agent.tools import report_platform_issue
+from openswe.tools import report_platform_issue
 
 
 class _Unserializable:
     """Stands in for LangGraph runtime objects, which have no JSON form."""
 
 
+@pytest.fixture
+def export(monkeypatch: pytest.MonkeyPatch) -> list[dict[str, Any]]:
+    calls: list[dict[str, Any]] = []
+
+    async def create_langsmith_thread_feedback(*args: Any, **kwargs: Any) -> bool:
+        calls.append({"args": args, "kwargs": kwargs})
+        return True
+
+    monkeypatch.setattr(
+        importlib.import_module("openswe.tools.report_platform_issue"),
+        "create_langsmith_thread_feedback",
+        create_langsmith_thread_feedback,
+    )
+    return calls
+
+
 @pytest.mark.asyncio
 async def test_report_platform_issue_logs_report_and_thread_details(
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
+    export: list[dict[str, Any]],
 ) -> None:
     thread = {
         "thread_id": "thread-1",
@@ -32,7 +49,7 @@ async def test_report_platform_issue_logs_report_and_thread_details(
             assert thread_id == "thread-1"
             return thread
 
-    module = importlib.import_module("agent.tools.report_platform_issue")
+    module = importlib.import_module("openswe.tools.report_platform_issue")
     monkeypatch.setattr(
         module,
         "get_config",
@@ -48,7 +65,7 @@ async def test_report_platform_issue_logs_report_and_thread_details(
     )
     monkeypatch.setattr(module, "langgraph_client", lambda: SimpleNamespace(threads=Threads()))
 
-    with caplog.at_level(logging.WARNING, logger="agent.tools.report_platform_issue"):
+    with caplog.at_level(logging.WARNING, logger="openswe.tools.report_platform_issue"):
         result = await report_platform_issue(
             problem_description="The sandbox command timed out",
             keywords=["sandbox", "timeout"],
@@ -77,24 +94,47 @@ async def test_report_platform_issue_logs_report_and_thread_details(
             },
         },
     }
+    assert result["export_status"] == "exported"
+    assert len(export) == 1
+    assert export[0]["args"] == ("thread-1", f"platform_issue:{report_id}")
+    assert export[0]["kwargs"] == {
+        "score": 0.0,
+        "comment": "The sandbox command timed out",
+        "source_info": {
+            "source": "report_platform_issue_tool",
+            "report_id": str(report_id),
+            "keywords": ["sandbox", "timeout"],
+        },
+    }
 
 
 @pytest.mark.asyncio
 async def test_report_platform_issue_survives_undiagnosable_run(
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
+    export: list[dict[str, Any]],
 ) -> None:
-    module = importlib.import_module("agent.tools.report_platform_issue")
+    module = importlib.import_module("openswe.tools.report_platform_issue")
 
     def no_runtime() -> dict[str, Any]:
         raise RuntimeError("called outside of a runnable context")
 
     monkeypatch.setattr(module, "get_config", no_runtime)
 
-    with caplog.at_level(logging.WARNING, logger="agent.tools.report_platform_issue"):
+    with caplog.at_level(logging.WARNING, logger="openswe.tools.report_platform_issue"):
         result = await report_platform_issue(problem_description="broken", keywords=["sandbox"])
 
     assert uuid.UUID(result["report_id"]).version == 7
     record = caplog.records[-1]
     assert record.message == "Platform issue reported"
     assert record.platform_issue_thread_details == {}
+    assert result["export_status"] == "logged_only"
+    assert export == []
+
+
+@pytest.mark.asyncio
+async def test_report_platform_issue_requires_description(caplog: pytest.LogCaptureFixture) -> None:
+    with caplog.at_level(logging.WARNING, logger="openswe.tools.report_platform_issue"):
+        with pytest.raises(ValueError, match="Describe the platform issue"):
+            await report_platform_issue(problem_description="   ", keywords=["sandbox"])
+    assert caplog.records == []

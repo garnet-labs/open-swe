@@ -1,56 +1,18 @@
-from unittest.mock import AsyncMock, MagicMock, patch
+from collections.abc import Callable
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
-from agent.dashboard.user_instructions import (
-    get_user_custom_instructions,
-    set_user_instructions,
-)
-from agent.tools.save_user_instructions import save_user_instructions
+from openswe.tools.save_user_instructions import save_user_instructions
 
 
 @pytest.mark.asyncio
-async def test_set_user_instructions_upserts_record() -> None:
-    client = MagicMock()
-    client.store.get_item = AsyncMock(return_value=None)
-    client.store.put_item = AsyncMock()
-    with patch("agent.store.store_client", return_value=client):
-        record = await set_user_instructions("octo", "Always run the linter.")
-    assert record["login"] == "octo"
-    assert record["instructions"] == "Always run the linter."
-    assert record["updated_by"] == "octo"
-    client.store.put_item.assert_awaited_once_with(["user_instructions"], "octo", record)
-
-
-@pytest.mark.asyncio
-async def test_get_user_custom_instructions_trims_text() -> None:
+async def test_save_user_instructions_requires_login(
+    grant_tool_access: Callable[..., None],
+) -> None:
+    grant_tool_access(private=True, owner=True)
     with patch(
-        "agent.dashboard.user_instructions.get_user_instructions",
-        new_callable=AsyncMock,
-        return_value={"instructions": "  Be terse.\n"},
-    ):
-        assert await get_user_custom_instructions("octo") == "Be terse."
-
-
-@pytest.mark.asyncio
-async def test_get_user_custom_instructions_returns_none_when_empty() -> None:
-    with patch(
-        "agent.dashboard.user_instructions.get_user_instructions",
-        new_callable=AsyncMock,
-        return_value={"instructions": "   "},
-    ):
-        assert await get_user_custom_instructions("octo") is None
-
-
-@pytest.mark.asyncio
-async def test_get_user_custom_instructions_without_login() -> None:
-    assert await get_user_custom_instructions(None) is None
-
-
-@pytest.mark.asyncio
-async def test_save_user_instructions_requires_login() -> None:
-    with patch(
-        "agent.tools.save_user_instructions.get_config",
+        "openswe.tools.save_user_instructions.get_config",
         return_value={"configurable": {}},
     ):
         result = await save_user_instructions("Always run tests.")
@@ -59,14 +21,15 @@ async def test_save_user_instructions_requires_login() -> None:
 
 
 @pytest.mark.asyncio
-async def test_save_user_instructions_writes_record() -> None:
+async def test_save_user_instructions_writes_record(grant_tool_access: Callable[..., None]) -> None:
+    grant_tool_access(private=True, owner=True)
     mock_set = AsyncMock(return_value={"instructions": "Always run tests."})
     with (
         patch(
-            "agent.tools.save_user_instructions.get_config",
+            "openswe.tools.save_user_instructions.get_config",
             return_value={"configurable": {"github_login": "octo"}},
         ),
-        patch("agent.tools.save_user_instructions.set_user_instructions", mock_set),
+        patch("openswe.tools.save_user_instructions.set_user_instructions", mock_set),
     ):
         result = await save_user_instructions("  Always run tests.  ")
     assert result["ok"] is True

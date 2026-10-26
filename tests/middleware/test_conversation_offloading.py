@@ -8,8 +8,8 @@ from langchain_core.language_models.fake_chat_models import FakeListChatModel
 from langchain_core.messages import AIMessage, HumanMessage
 from langgraph.checkpoint.memory import InMemorySaver
 
-from agent.middleware.conversation_offloading import ConversationOffloadingMiddleware
-from agent.middleware.prepare_run import BasePrepareRunMiddleware
+from openswe.middleware.conversation_offloading import ConversationOffloadingMiddleware
+from openswe.middleware.prepare_run import BasePrepareRunMiddleware
 
 
 async def test_manual_offload_preserves_history_and_hides_summary_stream(tmp_path):
@@ -148,7 +148,11 @@ async def test_manual_before_model_runs_after_prepare(tmp_path, monkeypatch):
         return original_status(value, **details)
 
     monkeypatch.setattr(middleware, "_status", status)
-    graph = create_agent(model=model, middleware=[middleware, Prepare()])
-    state = await graph.ainvoke({"messages": [HumanMessage(content="hello")]})
+    graph = create_agent(
+        model=model, middleware=[middleware, Prepare()], checkpointer=InMemorySaver()
+    )
+    config = {"configurable": {"thread_id": "manual-prepare"}}
+    await graph.ainvoke({"messages": [HumanMessage(content="hello")]}, config)
+    state = (await graph.aget_state(config)).values
     assert state["run_prepared"] is True
     assert state["conversation_offloading"]["status"] == "skipped"

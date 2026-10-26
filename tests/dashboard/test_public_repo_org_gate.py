@@ -5,9 +5,9 @@ from typing import Any, cast
 import pytest
 from httpx2 import Response
 
-from agent.github import webhook as github_webhooks
-from agent.webhooks import common as webhook_common
-from tests.conftest import post_signed_github_webhook
+from openswe.github import webhook as github_webhooks
+from openswe.webhooks import common as webhook_common
+from tests.conftest import post_signed_github_webhook, register_github_logins
 
 _TEST_WEBHOOK_SECRET = "test-secret-for-webhook"
 
@@ -35,11 +35,10 @@ def _common_setup(monkeypatch, *, gate: str = "langchain-ai") -> None:
     monkeypatch.setattr(webhook_common, "GITHUB_WEBHOOK_SECRET", _TEST_WEBHOOK_SECRET)
     monkeypatch.setattr(webhook_common, "PUBLIC_REPO_ORG_GATE", gate)
     monkeypatch.setattr(webhook_common, "ALLOWED_GITHUB_ORGS", frozenset())
+    register_github_logins(monkeypatch, "stranger", "insider")
 
 
-async def test_gate_blocks_non_member_on_public_pr_comment(
-    fake_store: Any, monkeypatch, registry_db
-) -> None:
+async def test_gate_blocks_non_member_on_public_pr_comment(monkeypatch, registry_db) -> None:
     _common_setup(monkeypatch)
     seen = _install_membership_stub(monkeypatch, members={"insider"})
 
@@ -79,9 +78,7 @@ async def test_gate_blocks_non_member_on_public_pr_comment(
     assert seen["calls"] == ["stranger"]
 
 
-async def test_gate_allows_org_member_on_public_pr_comment(
-    fake_store: Any, monkeypatch, registry_db
-) -> None:
+async def test_gate_allows_org_member_on_public_pr_comment(monkeypatch, registry_db) -> None:
     _common_setup(monkeypatch)
     _install_membership_stub(monkeypatch, members={"insider"})
 
@@ -121,7 +118,7 @@ async def test_gate_allows_org_member_on_public_pr_comment(
     assert called["event"] == "issue_comment"
 
 
-async def test_gate_skipped_on_private_repo(fake_store: Any, monkeypatch, registry_db) -> None:
+async def test_gate_skipped_on_private_repo(monkeypatch, registry_db) -> None:
     _common_setup(monkeypatch)
     seen = _install_membership_stub(monkeypatch, members=set())
 
@@ -162,7 +159,7 @@ async def test_gate_skipped_on_private_repo(fake_store: Any, monkeypatch, regist
     assert seen["calls"] == []
 
 
-async def test_gate_disabled_when_env_unset(fake_store: Any, monkeypatch, registry_db) -> None:
+async def test_gate_disabled_when_env_unset(monkeypatch, registry_db) -> None:
     _common_setup(monkeypatch, gate="")
     seen = _install_membership_stub(monkeypatch, members=set())
 
@@ -203,9 +200,7 @@ async def test_gate_disabled_when_env_unset(fake_store: Any, monkeypatch, regist
     assert seen["calls"] == []
 
 
-async def test_gate_blocks_non_member_on_public_issue(
-    fake_store: Any, monkeypatch, registry_db
-) -> None:
+async def test_gate_blocks_non_member_on_public_issue(monkeypatch, registry_db) -> None:
     _common_setup(monkeypatch)
     _install_membership_stub(monkeypatch, members={"insider"})
 
@@ -240,7 +235,7 @@ async def test_gate_blocks_non_member_on_public_issue(
 
 
 async def test_review_requested_is_unsupported_before_public_repo_gate(
-    fake_store: Any, monkeypatch, registry_db
+    monkeypatch, registry_db
 ) -> None:
     _common_setup(monkeypatch)
     seen = _install_membership_stub(monkeypatch, members={"insider"})
@@ -273,7 +268,7 @@ async def test_review_requested_is_unsupported_before_public_repo_gate(
     assert seen["calls"] == []
 
 
-async def test_gate_allows_internal_bot_sender(fake_store: Any, monkeypatch, registry_db) -> None:
+async def test_internal_bot_comment_never_prompts_the_agent(monkeypatch, registry_db) -> None:
     _common_setup(monkeypatch)
     seen = _install_membership_stub(monkeypatch, members=set())
 
@@ -309,14 +304,14 @@ async def test_gate_allows_internal_bot_sender(fake_store: Any, monkeypatch, reg
     )
 
     assert response.status_code == 200
-    assert response.json()["status"] == "accepted"
-    assert called["event"] == "issue_comment"
+    assert response.json()["status"] == "ignored"
+    assert called == {}
     assert seen["calls"] == []
 
 
 @pytest.mark.asyncio
 async def test_is_user_active_org_member_returns_false_when_no_token(monkeypatch) -> None:
-    from agent.github import org_membership as github_org_membership
+    from openswe.github import org_membership as github_org_membership
 
     async def fake_installation(_org: str) -> int:
         return 1
@@ -342,7 +337,7 @@ class _FakeAsyncClient:
     async def __aexit__(self, *_args) -> None:
         return None
 
-    async def get(self, *_args, **_kwargs):
+    async def request(self, *_args, **_kwargs):
         return self._response
 
 
@@ -356,7 +351,7 @@ class _FakeResponse:
 
 
 def _patch_membership_http(monkeypatch, response: _FakeResponse) -> dict[str, Any]:
-    from agent.github import org_membership as github_org_membership
+    from openswe.github import org_membership as github_org_membership
 
     seen: dict[str, Any] = {}
 
@@ -381,7 +376,7 @@ def _patch_membership_http(monkeypatch, response: _FakeResponse) -> dict[str, An
 
 @pytest.mark.asyncio
 async def test_is_user_active_org_member_handles_404(monkeypatch) -> None:
-    from agent.github import org_membership as github_org_membership
+    from openswe.github import org_membership as github_org_membership
 
     _patch_membership_http(monkeypatch, _FakeResponse(404))
 
@@ -390,7 +385,7 @@ async def test_is_user_active_org_member_handles_404(monkeypatch) -> None:
 
 @pytest.mark.asyncio
 async def test_is_user_active_org_member_active(monkeypatch) -> None:
-    from agent.github import org_membership as github_org_membership
+    from openswe.github import org_membership as github_org_membership
 
     seen = _patch_membership_http(monkeypatch, _FakeResponse(200, {"state": "active"}))
 
@@ -400,7 +395,7 @@ async def test_is_user_active_org_member_active(monkeypatch) -> None:
 
 @pytest.mark.asyncio
 async def test_is_user_active_org_member_pending_returns_false(monkeypatch) -> None:
-    from agent.github import org_membership as github_org_membership
+    from openswe.github import org_membership as github_org_membership
 
     _patch_membership_http(monkeypatch, _FakeResponse(200, {"state": "pending"}))
 

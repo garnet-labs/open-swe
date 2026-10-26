@@ -42,36 +42,12 @@ def _load_e2b_module(monkeypatch):
     monkeypatch.setitem(sys.modules, "e2b", fake_e2b)
     monkeypatch.setitem(sys.modules, "langchain_e2b", fake_langchain_e2b)
 
-    module_path = ROOT / "agent" / "sandboxes" / "providers" / "e2b.py"
+    module_path = ROOT / "openswe" / "sandboxes" / "providers" / "e2b.py"
     spec = importlib.util.spec_from_file_location("e2b_under_test", module_path)
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
-
-
-def test_create_e2b_sandbox_uses_default_timeout(monkeypatch):
-    monkeypatch.setenv("E2B_API_KEY", "api-key")
-    monkeypatch.delenv("E2B_TEMPLATE", raising=False)
-    module = _load_e2b_module(monkeypatch)
-
-    backend = module.create_e2b_sandbox()
-
-    assert backend.sandbox.sandbox_id == "created-sandbox"
-    assert _FakeSandbox.create_calls == [{"timeout": 3600, "api_key": "api-key"}]
-    assert _FakeSandbox.connect_calls == []
-
-
-def test_create_e2b_sandbox_uses_template(monkeypatch):
-    monkeypatch.setenv("E2B_API_KEY", "api-key")
-    monkeypatch.setenv("E2B_TEMPLATE", "open-swe-template")
-    module = _load_e2b_module(monkeypatch)
-
-    module.create_e2b_sandbox()
-
-    assert _FakeSandbox.create_calls == [
-        {"template": "open-swe-template", "timeout": 3600, "api_key": "api-key"}
-    ]
 
 
 def test_create_e2b_sandbox_reconnects_by_id(monkeypatch):

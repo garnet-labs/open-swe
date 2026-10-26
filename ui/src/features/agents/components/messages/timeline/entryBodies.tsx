@@ -5,27 +5,41 @@ import type { ToolExecutionChunk } from "@/features/agents/lib/types"
 
 export const ShellEntryBody = memo(function ShellEntryBody({
   chunk,
+  loadedText,
+  loadError,
 }: {
   chunk: ToolExecutionChunk
+  /** Full output fetched on expand; the chunk alone holds only a preview. */
+  loadedText?: string | null
+  loadError?: string | null
 }) {
   const command =
     typeof chunk.input?.command === "string" ? chunk.input.command : ""
-  const output = chunk.output ?? ""
+  const output = loadedText ?? chunk.output ?? ""
+  const pendingOutput = Boolean(chunk.loadOutput) && loadedText == null
 
   return (
-    <div className="space-y-1.5">
+    <div className="space-y-space-2">
       {command && (
-        <pre className="cursor-text overflow-x-auto font-mono text-[12px] leading-relaxed whitespace-pre text-foreground/85 select-text">
-          <span className="text-muted-foreground/80">$ </span>
+        <pre className="cursor-text overflow-x-auto font-mono text-xxs leading-relaxed whitespace-pre text-primary select-text">
+          <span className="text-tertiary">$ </span>
           {command}
         </pre>
       )}
       {output && <ToolResultBody value={output} />}
-      {!output && chunk.status === "in_progress" && (
-        <p className="font-mono text-[12px] text-muted-foreground">Running…</p>
+      {loadError && (
+        <p className="text-xxs text-error-secondary">{loadError}</p>
       )}
-      {!output && chunk.status === "pending" && (
-        <p className="font-mono text-[12px] text-warning-foreground">
+      {!loadError && pendingOutput && (
+        <p className="font-mono text-xxs text-secondary">
+          {output ? "Loading the rest of the output…" : "Loading output…"}
+        </p>
+      )}
+      {!output && !pendingOutput && chunk.status === "in_progress" && (
+        <p className="font-mono text-xxs text-secondary">Running…</p>
+      )}
+      {!output && !pendingOutput && chunk.status === "pending" && (
+        <p className="font-mono text-xxs text-warning-secondary">
           Waiting for approval…
         </p>
       )}

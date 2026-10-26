@@ -1,5 +1,6 @@
 /** @vitest-environment jsdom */
 
+import { TooltipProvider } from "@langchain/macaw-components/Tooltip"
 import { cleanup, render, screen } from "@testing-library/react"
 import { afterEach, describe, expect, it, vi } from "vitest"
 
@@ -17,6 +18,8 @@ vi.mock("@tanstack/react-query", () => ({
       markdown: "",
     },
   }),
+  useMutation: () => ({ isPending: false, mutate: vi.fn() }),
+  useQueryClient: () => ({}),
 }))
 vi.mock("@tanstack/react-router", () => ({
   useNavigate: () => vi.fn(),
@@ -33,7 +36,9 @@ afterEach(() => {
 describe("InlinePlanArtifact", () => {
   it("uses artifact terminology for shared HTML reports", () => {
     mocks.status = "shared"
-    render(<InlinePlanArtifact threadId="thread-1" />)
+    render(<InlinePlanArtifact threadId="thread-1" />, {
+      wrapper: TooltipProvider,
+    })
 
     expect(
       screen.getByRole("button", { name: "Open artifact in the conversation" })
@@ -42,13 +47,15 @@ describe("InlinePlanArtifact", () => {
     expect(screen.getByTitle("Artifact preview")).toBeTruthy()
   })
 
-  it("keeps plan terminology for implementation plans", () => {
-    render(<InlinePlanArtifact threadId="thread-1" />)
+  it("uses artifact terminology for legacy implementation plans", () => {
+    render(<InlinePlanArtifact threadId="thread-1" />, {
+      wrapper: TooltipProvider,
+    })
 
     expect(
-      screen.getByRole("button", { name: "Open plan in the conversation" })
+      screen.getByRole("button", { name: "Open artifact in the conversation" })
         .textContent
-    ).toContain("Open plan")
-    expect(screen.getByTitle("Plan preview")).toBeTruthy()
+    ).toContain("Open artifact")
+    expect(screen.getByTitle("Artifact preview")).toBeTruthy()
   })
 })

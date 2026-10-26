@@ -1,21 +1,28 @@
 import { useEffect, useRef } from "react"
 import { CatchBoundary } from "@tanstack/react-router"
+import { Skeleton } from "@langchain/macaw-components/Skeleton"
 import { LoadError, useLoadTimedOut } from "@/components/LoadError"
 
 import { AgentThreadView } from "@/features/agents/components/AgentThreadView"
-import { Skeleton } from "@/components/ui/skeleton"
+import { SubagentThreadView } from "@/features/agents/components/subagents/SubagentThreadView"
 import { AgentThreadStreamBoundary } from "@/features/agents/lib/provider/useIsInAgentThreadStream"
+import { ThreadSourceProvider } from "@/features/agents/lib/threadSource/ThreadSourceProvider"
 import { useAgentThread } from "@/features/agents/lib/queries"
 import {
   ensureThreadLoad,
   threadDetailFailed,
   threadDetailResolved,
 } from "@/lib/perf/threadLoad"
+import { pageTitle } from "@/lib/pageTitle"
 
 export function AgentThreadPage(props: {
   threadId: string
   active?: boolean
-  autoFocusComposer?: boolean
+  /** Show this subagent's transcript instead of the thread's own. */
+  subagentId?: string
+  composerDraft?: { key: number; text: string }
+  /** False when the thread is embedded in a page that names the tab itself. */
+  ownsTitle?: boolean
 }) {
   return (
     <CatchBoundary
@@ -37,13 +44,18 @@ export function AgentThreadPage(props: {
 function AgentThreadContent({
   threadId,
   active = true,
-  autoFocusComposer = false,
+  subagentId,
+  composerDraft,
+  ownsTitle = true,
 }: {
   threadId: string
   active?: boolean
-  autoFocusComposer?: boolean
+  subagentId?: string
+  composerDraft?: { key: number; text: string }
+  ownsTitle?: boolean
 }) {
   const threadQuery = useAgentThread(threadId)
+  const transcript = threadQuery.data?.transcript === "v2"
   const timedOut = useLoadTimedOut(threadQuery.isPending)
   const title = threadQuery.data?.title
   const hasDetail = threadQuery.data !== undefined
@@ -62,17 +74,17 @@ function AgentThreadContent({
   }, [active, hasDetail, threadId, threadQuery.isError])
 
   useEffect(() => {
-    if (!active || !title) return
-    const documentTitle = `${title} - Open SWE`
+    if (!active || !ownsTitle || !title) return
+    const documentTitle = pageTitle(title)
     document.title = documentTitle
     return () => {
-      if (document.title === documentTitle) document.title = "Open SWE"
+      if (document.title === documentTitle) document.title = pageTitle("Agents")
     }
-  }, [active, title])
+  }, [active, ownsTitle, title])
 
   if (threadQuery.isPending && !timedOut) {
     return (
-      <main className="flex min-w-0 flex-1 items-center justify-center p-6">
+      <main className="flex min-w-0 flex-1 items-center justify-center p-space-5">
         <Skeleton className="h-40 w-full max-w-md" />
       </main>
     )
@@ -93,10 +105,20 @@ function AgentThreadContent({
 
   return (
     <AgentThreadStreamBoundary active={active}>
-      <AgentThreadView
-        thread={threadQuery.data}
-        autoFocusComposer={autoFocusComposer}
-      />
+      <ThreadSourceProvider threadId={threadId} transcript={transcript}>
+        {subagentId ? (
+          <SubagentThreadView
+            key={subagentId}
+            thread={threadQuery.data}
+            subagentId={subagentId}
+          />
+        ) : (
+          <AgentThreadView
+            thread={threadQuery.data}
+            composerDraft={composerDraft}
+          />
+        )}
+      </ThreadSourceProvider>
     </AgentThreadStreamBoundary>
   )
 }

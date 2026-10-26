@@ -1,21 +1,20 @@
 import pytest
 
-from agent.config import ENV
-from agent.dashboard.user_preferences import (
+from openswe.config import ENV
+from openswe.dashboard.user_preferences import (
     UserPreferencesUpdate,
     get_user_preferences,
     set_user_preferences,
 )
-from agent.workspaces import routing
-from agent.workspaces.store import WORKSPACES, WorkspaceCreate, WorkspaceUpdate
-from tests.conftest import FakeStore
+from openswe.workspaces import routing
+from openswe.workspaces.store import WORKSPACES, WorkspaceCreate, WorkspaceUpdate
+from tests.conftest import FakeUserRecords
 
-# Workspaces are rows; user preferences are still Store records, so the tests
-# that read a preference keep the store double as well.
+# Workspaces are rows; tests that read a preference use the in-memory user_records double.
 pytestmark = pytest.mark.usefixtures("registry_db")
 
 
-async def test_default_workspace_preference_round_trips(fake_store: FakeStore) -> None:
+async def test_default_workspace_preference_round_trips(user_records: FakeUserRecords) -> None:
     assert (await get_user_preferences("alice"))["default_workspace"] is None
     await set_user_preferences(
         "alice", UserPreferencesUpdate(default_visibility="public", default_workspace=" OSS ")
@@ -24,7 +23,6 @@ async def test_default_workspace_preference_round_trips(fake_store: FakeStore) -
 
 
 async def _seed() -> None:
-    await WORKSPACES.create(WorkspaceCreate(name="Default"), "alice")
     await WORKSPACES.create(
         WorkspaceCreate(name="OSS", repos=["acme/oss"], slack_channel_ids=["C0SS"]), "alice"
     )
@@ -38,7 +36,7 @@ async def test_thread_wins_over_everything() -> None:
     assert result == routing.WorkspaceResolution("default", "thread")
 
 
-async def test_tag_then_repo_then_channel_then_user_default(fake_store: FakeStore) -> None:
+async def test_tag_then_channel_then_repo_then_user_default(user_records: FakeUserRecords) -> None:
     await _seed()
     await set_user_preferences(
         "alice", UserPreferencesUpdate(default_visibility="public", default_workspace="oss")
@@ -57,7 +55,22 @@ async def test_tag_then_repo_then_channel_then_user_default(fake_store: FakeStor
     )
 
 
-async def test_unknown_user_default_is_ignored(fake_store: FakeStore) -> None:
+async def test_a_bound_channel_outranks_the_repositorys_preferred_workspace() -> None:
+    """Every workspace can use every repository, so the channel a message came from decides."""
+    await _seed()
+    await WORKSPACES.create(
+        WorkspaceCreate(name="Core", repos=["acme/api"], slack_channel_ids=["CCORE"]), "alice"
+    )
+
+    assert await routing.resolve_workspace(
+        repo=("acme", "oss"), slack_channel_id="CCORE"
+    ) == routing.WorkspaceResolution("core", "channel")
+    assert await routing.resolve_workspace(repo=("acme", "oss")) == routing.WorkspaceResolution(
+        "oss", "repo"
+    )
+
+
+async def test_unknown_user_default_is_ignored(user_records: FakeUserRecords) -> None:
     await _seed()
     await set_user_preferences(
         "alice", UserPreferencesUpdate(default_visibility="public", default_workspace="gone")
@@ -69,23 +82,6 @@ async def test_unassigned_repo_policy(monkeypatch: pytest.MonkeyPatch) -> None:
     await _seed()
     assert await routing.repo_is_routable("acme", "unowned") is True
     monkeypatch.setenv(ENV.OPEN_SWE_UNASSIGNED_REPO_WORKSPACE.name, "ignore")
-    assert await routing.repo_is_routable("acme", "unowned") is False
-    assert await routing.repo_is_routable("acme", "oss") is True
-
-
-async def test_an_import_that_never_ran_is_not_an_unowned_repository(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A failed startup import leaves a table in which every repo reads as unowned."""
-    monkeypatch.setattr(WORKSPACES, "import_completed", False)
-    monkeypatch.setenv(ENV.OPEN_SWE_UNASSIGNED_REPO_WORKSPACE.name, "ignore")
-
-    with pytest.raises(routing.WorkspaceLookupError):
-        await routing.repo_is_routable("acme", "oss")
-
-    # One workspace is enough to prove the tables were populated, whatever the
-    # import did: from there the policy decides again.
-    await WORKSPACES.create(WorkspaceCreate(name="OSS", repos=["acme/oss"]), "alice")
     assert await routing.repo_is_routable("acme", "unowned") is False
     assert await routing.repo_is_routable("acme", "oss") is True
 

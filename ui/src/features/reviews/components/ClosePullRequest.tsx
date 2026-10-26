@@ -1,37 +1,45 @@
-import { useState } from "react"
-
+import { Button } from "@langchain/macaw-components/Button"
 import type { OpenPullRequest } from "@/lib/api"
 import { actionLabel, githubActions } from "../lib/githubActions"
+import { pullRequestKey } from "../lib/status"
 import { usePullRequestAction } from "../lib/usePullRequestAction"
-import { ConfirmCloseDialog } from "./ConfirmCloseDialog"
-import { PullRequestActionButton } from "./PullRequestActionButton"
+import { TextPopover } from "./TextPopover"
 
 export function ClosePullRequest({
   pr,
+  apply,
   onClosed,
 }: {
   pr: OpenPullRequest
-  onClosed: () => void
+  apply: () => () => void
+  onClosed?: () => void
 }) {
-  const [confirming, setConfirming] = useState(false)
-  const close = usePullRequestAction({ pr, action: "close", onDone: onClosed })
+  const close = usePullRequestAction({
+    pr,
+    action: "close",
+    apply,
+    onDone: onClosed,
+  })
   return (
-    <PullRequestActionButton
-      label={actionLabel(githubActions.close.labels, close)}
-      disabled={close.isPending || close.isSuccess}
-      onClick={() => setConfirming(true)}
-      errors={[close.error]}
-    >
-      {confirming && (
-        <ConfirmCloseDialog
-          pr={pr}
-          onCancel={() => setConfirming(false)}
-          onConfirm={() => {
-            setConfirming(false)
-            close.mutate()
-          }}
-        />
-      )}
-    </PullRequestActionButton>
+    <div>
+      <TextPopover
+        trigger={
+          <Button
+            size="xs"
+            color="secondary"
+            variant="outlined"
+            disabled={close.isPending || close.isSuccess}
+            aria-live="polite"
+          >
+            {actionLabel(githubActions.close.labels, close)}
+          </Button>
+        }
+        title={`Close ${pullRequestKey(pr)}?`}
+        description="GitHub closes it without merging. A reason is posted as a comment."
+        placeholder="Reason (optional)"
+        submitLabel="Close pull request"
+        onSubmit={(reason) => close.mutateAsync(reason)}
+      />
+    </div>
   )
 }

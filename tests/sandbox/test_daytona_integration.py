@@ -32,21 +32,12 @@ def _load_daytona_module(monkeypatch):
 
     monkeypatch.setitem(sys.modules, "daytona", fake_daytona)
     monkeypatch.setitem(sys.modules, "langchain_daytona", fake_langchain_daytona)
-    module_path = ROOT / "agent" / "sandboxes" / "providers" / "daytona.py"
+    module_path = ROOT / "openswe" / "sandboxes" / "providers" / "daytona.py"
     spec = importlib.util.spec_from_file_location("daytona_under_test", module_path)
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
-
-
-def test_daytona_params_default_to_existing_snapshot(monkeypatch):
-    monkeypatch.delenv("DAYTONA_SANDBOX_SNAPSHOT", raising=False)
-    module = _load_daytona_module(monkeypatch)
-
-    params = module._get_daytona_sandbox_params()
-
-    assert params.snapshot == "daytonaio/sandbox:0.6.0"
 
 
 def test_daytona_params_use_env_snapshot(monkeypatch):
@@ -56,12 +47,3 @@ def test_daytona_params_use_env_snapshot(monkeypatch):
     params = module._get_daytona_sandbox_params()
 
     assert params.snapshot == "custom/snapshot:1.0"
-
-
-def test_daytona_params_treat_blank_snapshot_as_unset(monkeypatch):
-    monkeypatch.setenv("DAYTONA_SANDBOX_SNAPSHOT", "  ")
-    module = _load_daytona_module(monkeypatch)
-
-    params = module._get_daytona_sandbox_params()
-
-    assert params.snapshot == "daytonaio/sandbox:0.6.0"

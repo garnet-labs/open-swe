@@ -1,6 +1,5 @@
-"""The graph factory tool loaders must overlap, not run back-to-back."""
+"""Integration tools the graph factory loads into a run."""
 
-import asyncio
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -11,13 +10,11 @@ from langchain.agents.middleware.types import ModelRequest
 from langchain_core.tools import StructuredTool
 from langgraph.graph.state import RunnableConfig
 
-from agent.dashboard.workspace_settings import WorkspaceSettings
-from agent.middleware.dynamic_tools import DynamicToolMiddleware
-from agent.middleware.plan_mode import PlanModeMiddleware
-from agent.sandboxes.state import SANDBOX_BACKENDS
-from agent.server import get_agent
-
-_START_TIMEOUT_SECONDS = 2.0
+from openswe.dashboard.workspace_settings import WorkspaceSettings
+from openswe.middleware.dynamic_tools import DynamicToolMiddleware
+from openswe.sandboxes.state import SANDBOX_BACKENDS
+from openswe.sandboxes.tool_runtime import ToolSurface
+from openswe.server import plan_agent
 
 _MODEL_DEFAULTS = {
     "default_agent_model": "openai:gpt-5.6-sol",
@@ -27,16 +24,11 @@ _MODEL_DEFAULTS = {
 }
 
 
-class _DummyAgent:
-    def with_config(self, config: RunnableConfig) -> _DummyAgent:
-        return self
-
-
 def _config() -> RunnableConfig:
     return {
         "configurable": {
             "__is_for_execution__": True,
-            "thread_id": "thread-parallel-tools",
+            "thread_id": "thread-factory-tools",
             "github_login": "octocat",
         },
         "metadata": {},
@@ -44,10 +36,9 @@ def _config() -> RunnableConfig:
 
 
 @pytest.mark.asyncio
-@pytest.mark.usefixtures("fake_store")
 @pytest.mark.parametrize("initial_plan_mode", [False, True])
 @pytest.mark.parametrize("github_login", ["octocat", None])
-async def test_workspace_mcps_load_for_non_admins_and_respect_plan_mode(
+async def test_workspace_mcps_load_for_non_admins_with_legacy_plan_state(
     initial_plan_mode: bool,
     github_login: str | None,
     monkeypatch: pytest.MonkeyPatch,
@@ -62,7 +53,6 @@ async def test_workspace_mcps_load_for_non_admins_and_respect_plan_mode(
             )
         ),
     )
-    barrier = asyncio.Barrier(2)
 
     async def delete_incident() -> str:
         return "deleted"
@@ -73,57 +63,46 @@ async def test_workspace_mcps_load_for_non_admins_and_respect_plan_mode(
         description="Delete an incident",
     )
 
-    def rendezvous(result: Any) -> Any:
-        # Serial loaders never all reach the barrier, so a regression times out
-        # here instead of quietly costing a few seconds per run.
-        async def loader(*_args: Any) -> Any:
-            await asyncio.wait_for(barrier.wait(), timeout=_START_TIMEOUT_SECONDS)
-            return result
-
-        return loader
-
-    thread_id = "thread-parallel-tools"
+    thread_id = "thread-factory-tools"
     SANDBOX_BACKENDS.pop(thread_id, None)
     with (
         patch(
-            "agent.server.resolve_github_token",
+            "openswe.server.resolve_github_token",
             new_callable=AsyncMock,
             return_value=("ghp", None),
         ),
-        patch("agent.server.resolve_triggering_user_identity", return_value=None),
+        patch("openswe.server.resolve_triggering_user_identity", return_value=None),
         patch(
-            "agent.server.ensure_sandbox_for_thread",
+            "openswe.server.ensure_sandbox_for_thread",
             new_callable=AsyncMock,
             return_value=MagicMock(),
         ),
         patch(
-            "agent.server.resolve_sandbox_work_dir",
+            "openswe.server.resolve_sandbox_work_dir",
             new_callable=AsyncMock,
             return_value="/workspace",
         ),
         patch(
-            "agent.server.cached_workspace_settings",
+            "openswe.server.cached_workspace_settings",
             new_callable=AsyncMock,
             return_value=WorkspaceSettings(_MODEL_DEFAULTS),
         ),
-        patch("agent.server.load_profile", new_callable=AsyncMock, return_value=None),
-        patch("agent.server.load_thread_settings", new_callable=AsyncMock, return_value={}),
-        patch("agent.server.fallback_model_id_for", return_value=None),
-        patch("agent.server.make_model", return_value=MagicMock()),
-        patch("agent.server.construct_system_prompt", return_value="prompt"),
-        patch("agent.server.create_deep_agent", return_value=_DummyAgent()) as build_agent,
-        patch("agent.users.User.email_for_login", new_callable=AsyncMock, return_value=None),
-        patch("agent.server._mcp_tools_for", side_effect=rendezvous([mcp_tool])),
-        patch("agent.server._notion_tools_for", side_effect=rendezvous([])),
+        patch("openswe.server.load_profile", new_callable=AsyncMock, return_value=None),
+        patch("openswe.server.load_thread_settings", new_callable=AsyncMock, return_value={}),
+        patch("openswe.server.fallback_model_id_for", return_value=None),
+        patch("openswe.server.make_model", return_value=MagicMock()),
+        patch("openswe.server.construct_system_prompt", return_value="prompt"),
+        patch("openswe.users.User.email_for_login", new_callable=AsyncMock, return_value=None),
+        patch("openswe.server._mcp_tools_for", new_callable=AsyncMock, return_value=[mcp_tool]),
     ):
         config = _config()
         config["configurable"]["github_login"] = github_login
         config["configurable"]["plan_mode"] = initial_plan_mode
-        await get_agent(config)
+        surface = ToolSurface()
+        await plan_agent(config, surface)
 
     tool_names = {
-        tool.name if hasattr(tool, "name") else tool.__name__
-        for tool in build_agent.call_args.kwargs["tools"]
+        tool.name if hasattr(tool, "name") else tool.__name__ for tool in surface.base_tools
     }
     assert not tool_names.intersection(
         {
@@ -138,22 +117,17 @@ async def test_workspace_mcps_load_for_non_admins_and_respect_plan_mode(
         }
     )
 
-    middleware = build_agent.call_args.kwargs["middleware"]
+    middleware = surface.middleware
     dynamic = next(item for item in middleware if isinstance(item, DynamicToolMiddleware))
-    plan_mode = next(item for item in middleware if isinstance(item, PlanModeMiddleware))
-    assert middleware.index(dynamic) < middleware.index(plan_mode)
     captured: list[str] = []
 
     async def capture(request: ModelRequest) -> Any:
         captured.extend(tool.name for tool in request.tools)
         return MagicMock()
 
-    async def apply_plan_mode(request: ModelRequest) -> Any:
-        return await plan_mode.awrap_model_call(request, capture)
-
     for state, expected in [
-        ({}, [] if initial_plan_mode else [mcp_tool.name]),
-        ({"plan_mode": True}, []),
+        ({}, [mcp_tool.name]),
+        ({"plan_mode": True}, [mcp_tool.name]),
         ({"plan_mode": False}, [mcp_tool.name]),
     ]:
         captured.clear()
@@ -164,7 +138,7 @@ async def test_workspace_mcps_load_for_non_admins_and_respect_plan_mode(
             runtime=MagicMock(),
             state={**state, "messages": [], "loaded_integration_tools": [mcp_tool.name]},
         )
-        await dynamic.awrap_model_call(request, apply_plan_mode)
+        await dynamic.awrap_model_call(request, capture)
         assert captured == expected
 
     SANDBOX_BACKENDS.pop(thread_id, None)

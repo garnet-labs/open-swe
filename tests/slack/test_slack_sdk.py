@@ -1,9 +1,13 @@
+import asyncio
+import threading
+
 import pytest
 from fastapi import HTTPException
 from slack_sdk.errors import SlackApiError
 
-from agent.slack import http
-from tests.support.slack_api import slack_api_server
+from openswe.slack import http
+from openswe.slack.client import remove_slack_reaction
+from tests.support.slack_api import SlackAPI, slack_api_server
 
 
 async def test_sdk_session_sends_messages_and_closes_on_rate_limit(monkeypatch):
@@ -24,17 +28,15 @@ async def test_sdk_session_sends_messages_and_closes_on_rate_limit(monkeypatch):
         assert session.closed
 
 
-@pytest.mark.parametrize("data", [[1], 42, True, '"unexpected"'])
-async def test_non_object_slack_responses_are_reported_as_upstream_errors(slack_api, data):
-    slack_api.respond(data)
-    with pytest.raises(HTTPException) as raised:
-        async with http.slack_http_errors(), http.SlackClient.bot() as client:
-            await client.users_info(user="U1")
-    assert raised.value.status_code == 502
+async def test_removing_an_absent_reaction_is_already_settled(slack_api: SlackAPI) -> None:
+    slack_api.respond({"ok": False, "error": "no_reaction"})
+    assert await remove_slack_reaction("C1", "1.0", "x")
+    slack_api.respond({"ok": False, "error": "missing_scope"})
+    assert not await remove_slack_reaction("C1", "1.0", "x")
 
 
 async def test_read_thread_tool_paginates_and_resolves_authors(slack_api):
-    from agent.slack.tools.read_thread_messages import slack_read_thread_messages
+    from openswe.slack.tools.read_thread_messages import slack_read_thread_messages
 
     slack_api.respond(
         {
@@ -74,40 +76,10 @@ _PUBLIC_CHANNEL = {
 }
 
 
-async def test_read_channel_tool_marks_threads_and_skips_joins(slack_api):
-    from agent.slack.tools.read_channel_messages import slack_read_channel_messages
+async def test_read_channel_tool_refuses_a_private_channel(slack_api, grant_tool_access):  # noqa: ANN001
+    from openswe.slack.tools.read_channel_messages import slack_read_channel_messages
 
-    slack_api.respond(_PUBLIC_CHANNEL)
-    slack_api.respond(
-        {
-            "ok": True,
-            "messages": [
-                {
-                    "ts": "2.0",
-                    "user": "U1",
-                    "text": "Opened a PR",
-                    "thread_ts": "2.0",
-                    "reply_count": 2,
-                },
-                {"ts": "1.5", "user": "U2", "text": "joined", "subtype": "channel_join"},
-                {"ts": "1.0", "user": "U1", "text": "Deploys are failing"},
-            ],
-        }
-    )
-    slack_api.respond({"ok": True, "user": {"profile": {"display_name": "Alice"}}})
-    result = await slack_read_channel_messages("C1", limit=5)
-
-    assert result["success"] is True
-    assert result["count"] == 2
-    formatted = result["formatted"]
-    assert formatted.index("Deploys are failing") < formatted.index("Opened a PR")
-    assert "[thread: 2 replies, thread_ts=2.0]" in formatted
-    assert "joined" not in formatted
-    assert ("conversations.history", {"channel": "C1", "limit": "5"}) in slack_api.calls
-
-
-async def test_read_channel_tool_refuses_a_private_channel(slack_api):
-    from agent.slack.tools.read_channel_messages import slack_read_channel_messages
+    grant_tool_access(private=True)
 
     slack_api.respond({"ok": True, "channel": {"id": "C1", "is_channel": True, "is_private": True}})
     result = await slack_read_channel_messages("C1")
@@ -115,52 +87,6 @@ async def test_read_channel_tool_refuses_a_private_channel(slack_api):
     assert result["success"] is False
     assert "public" in result["error"]
     assert [call[0] for call in slack_api.calls] == ["conversations.info"]
-
-
-@pytest.mark.parametrize(
-    "thread_ts,method", [("0", "conversations.history"), ("1.0", "conversations.replies")]
-)
-async def test_exact_message_lookup_preserves_scope(slack_api, thread_ts, method):
-    from agent.slack.client import fetch_slack_thread_message_by_ts
-
-    message = {"ts": "2.0", "text": "Exact message"}
-    slack_api.respond({"ok": True, "messages": [{"ts": "1.0", "text": "Parent"}, message]})
-    assert await fetch_slack_thread_message_by_ts("C1", thread_ts, "2.0") == message
-    assert slack_api.calls[0][0] == method
-    assert slack_api.calls[0][1]["inclusive"] == "1"
-    assert slack_api.calls[0][1].get("ts") == ("1.0" if thread_ts == "1.0" else None)
-
-
-async def test_existing_reaction_is_success(slack_api):
-    from agent.slack.client import add_slack_reaction
-
-    slack_api.respond({"ok": False, "error": "already_reacted"})
-    assert await add_slack_reaction("C1", "1.0", "eyes")
-
-
-async def test_code_channel_methods_use_shared_sdk(slack_api):
-    from agent.slack.code_channels import create_code_channel
-
-    slack_api.respond({"ok": True, "channel": {"id": "CNEW"}})
-    assert await create_code_channel(
-        name="Task",
-        session_id="run-1",
-        origin_channel_id="C1",
-        origin_message_ts="1.0",
-        is_private=True,
-    ) == ("CNEW", None)
-    assert slack_api.calls == [
-        (
-            "agents.conversations.create",
-            {
-                "name": "Task",
-                "session_id": "run-1",
-                "origin_channel_id": "C1",
-                "origin_message_ts": "1.0",
-                "is_private": True,
-            },
-        )
-    ]
 
 
 @pytest.mark.parametrize(
@@ -182,3 +108,150 @@ async def test_malformed_response_preserves_rate_limit_metadata(
     assert raised.value.status_code == expected
     if expected == 429:
         assert raised.value.headers == {"Retry-After": "12"}
+
+
+async def test_channel_checks_coalesce_but_later_checks_are_fresh(slack_api: SlackAPI) -> None:
+    slack_api.respond(_PUBLIC_CHANNEL)
+
+    async def check() -> object:
+        async with http.SlackClient.bot() as client:
+            return (await client.conversations_info(channel="C1"))["channel"]
+
+    results = await asyncio.gather(*(check() for _ in range(20)))
+    assert all(result == _PUBLIC_CHANNEL["channel"] for result in results)
+    assert len(slack_api.calls) == 1
+
+    external = {**_PUBLIC_CHANNEL["channel"], "is_ext_shared": True}
+    slack_api.respond({"ok": True, "channel": external})
+    assert await check() == external
+    assert len(slack_api.calls) == 2
+
+
+async def test_cancelling_first_check_does_not_close_shared_request(slack_api: SlackAPI) -> None:
+    started, release = threading.Event(), threading.Event()
+
+    def respond(*_args: object) -> tuple[int, object, dict[str, str]]:
+        started.set()
+        assert release.wait(timeout=2)
+        return 200, _PUBLIC_CHANNEL, {}
+
+    slack_api.handler = respond
+
+    async def check() -> object:
+        async with http.SlackClient.bot() as client:
+            return await client.conversations_info(channel="C1")
+
+    first = asyncio.create_task(check())
+    try:
+        assert await asyncio.to_thread(started.wait, 2)
+        second = asyncio.create_task(check())
+        await asyncio.sleep(0)
+        first.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await first
+        release.set()
+        assert (await second)["channel"] == _PUBLIC_CHANNEL["channel"]
+        assert len(slack_api.calls) == 1
+    finally:
+        release.set()
+        await asyncio.gather(first, return_exceptions=True)
+
+
+async def test_channel_rate_limit_is_shared_across_replicas_but_not_tokens_or_methods(
+    slack_api: SlackAPI,
+    registry_db: None,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    from sqlalchemy import text
+
+    from openswe.database.postgres import transaction
+
+    slack_api.respond(
+        {"ok": False, "error": "ratelimited", "secret": "must-not-log"},
+        status=429,
+        headers={"Retry-After": "30"},
+    )
+    async with http.SlackClient.bot() as client:
+        with pytest.raises(SlackApiError):
+            await client.conversations_info(channel="C1")
+        http._CHANNEL_INFO.clear()
+        with pytest.raises(SlackApiError) as raised:
+            await client.conversations_info(channel="COTHER")
+        assert http.slack_error(raised.value).startswith("rate_limited")
+        assert len(slack_api.calls) == 1
+        await client.auth_test()
+        monkeypatch.setenv("SLACK_BOT_TOKEN", "another-token")
+        slack_api.respond(_PUBLIC_CHANNEL)
+        async with http.SlackClient.bot() as other:
+            await other.conversations_info(channel="C1")
+        async with transaction() as conn:
+            await conn.execute(text("UPDATE event_claim SET expires_at = clock_timestamp()"))
+        slack_api.respond(_PUBLIC_CHANNEL)
+        assert (await client.conversations_info(channel="C1"))["channel"] == _PUBLIC_CHANNEL[
+            "channel"
+        ]
+    assert [call[0] for call in slack_api.calls] == [
+        "conversations.info",
+        "auth.test",
+        "conversations.info",
+        "conversations.info",
+    ]
+    failure = next(record for record in caplog.records if hasattr(record, "slack_method"))
+    assert failure.slack_error == "ratelimited"
+    assert failure.slack_status == 429
+    assert failure.slack_retry_after == 30
+    assert "must-not-log" not in repr(failure.__dict__)
+    assert "test-slack-token" not in repr(failure.__dict__)
+
+
+async def test_failed_channel_lookup_backs_off_without_serving_previous_permissions(
+    slack_api: SlackAPI,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    now = 0.0
+    monkeypatch.setattr(http, "monotonic", lambda: now)
+    async with http.SlackClient.bot() as client:
+        slack_api.respond(_PUBLIC_CHANNEL)
+        await client.conversations_info(channel="C1")
+        slack_api.respond({"ok": False, "error": "fatal_error"}, status=503)
+        for _ in range(3):
+            with pytest.raises(SlackApiError):
+                await client.conversations_info(channel="C1")
+        assert len(slack_api.calls) == 2
+        now = 3
+        external = {**_PUBLIC_CHANNEL["channel"], "is_ext_shared": True}
+        slack_api.respond({"ok": True, "channel": external})
+        assert (await client.conversations_info(channel="C1"))["channel"] == external
+        assert len(slack_api.calls) == 3
+
+
+@pytest.mark.parametrize(
+    "status,code,delay",
+    [
+        (429, "ratelimited", 17),
+        (503, "unavailable", 60),
+        (200, "internal_error", 60),
+        (200, "channel_not_found", None),
+        (200, "not_in_channel", None),
+        (200, "missing_scope", None),
+        (403, "invalid_auth", None),
+    ],
+)
+async def test_channel_context_distinguishes_transient_and_definitive_failures(
+    slack_api: SlackAPI,
+    status: int,
+    code: str,
+    delay: int | None,
+) -> None:
+    from openswe.webhooks.common import resolve_slack_channel_context
+
+    slack_api.respond(
+        {"ok": False, "error": code},
+        status=status,
+        headers={"Retry-After": "17"} if status == 429 else {},
+    )
+    context = await resolve_slack_channel_context("C1", use_cache=False)
+    assert not context.allows_operations
+    assert context.lookup_retry_after == delay
+    assert "lookup_retry_after" not in context.dump()

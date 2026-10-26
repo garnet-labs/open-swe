@@ -10,7 +10,6 @@ import {
   threadDetailResolved,
   threadHydrated,
   threadHydrationFailed,
-  threadLocalResolved,
   threadTranscriptBuilt,
   threadTranscriptPainted,
 } from "./threadLoad"
@@ -63,19 +62,18 @@ describe("thread load span", () => {
     expect(getPerfSpans()).toHaveLength(1)
   })
 
-  it("tracks a desktop thread route through its IPC step", () => {
-    onRouterNavigation(`/agents/local/${THREAD_A}`, "/agents")
-    ensureThreadLoad(THREAD_A)
-    threadLocalResolved(THREAD_A)
+  it("tags which thread UI the span measured", () => {
+    onRouterNavigation(`/assistant/${THREAD_A}`, "/assistant")
+    ensureThreadLoad(THREAD_A, "assistant")
     threadHydrated(THREAD_A)
     threadTranscriptPainted(THREAD_A, { messages: 1, chunks: 1 })
+    onRouterNavigation(`/agents/${THREAD_B}`, `/assistant/${THREAD_A}`)
+    ensureThreadLoad(THREAD_B)
+    threadTranscriptPainted(THREAD_B, { messages: 1, chunks: 1 })
 
-    const [span] = getPerfSpans()
-    expect(span?.status).toBe("ended")
-    expect(span?.steps.map((step) => step.name)).toEqual([
-      "local",
-      "hydrate",
-      "paint",
+    expect(getPerfSpans().map((span) => span.attributes.ui)).toEqual([
+      "assistant",
+      "agents",
     ])
   })
 

@@ -1,14 +1,9 @@
 import { describe, expect, it } from "vitest"
 
-import type { DesktopLocalThreadSummary, DesktopProject } from "@/desktop"
 import type { AgentThread } from "./types"
 import {
-  applyProjectKeyAliases,
-  cloudProjectKeysByLabel,
   cloudSidebarThread,
-  groupSidebarThreadsByProject,
-  localSidebarThread,
-  sidebarProjectOptions,
+  groupRepoGroupsByWorkspace,
   sortSidebarThreads,
 } from "./sidebarThreads"
 
@@ -29,76 +24,13 @@ function cloudThread(overrides: Partial<AgentThread> = {}): AgentThread {
   }
 }
 
-function localThread(
-  overrides: Partial<DesktopLocalThreadSummary> = {}
-): DesktopLocalThreadSummary {
-  return {
-    id: "same-id",
-    cwd: "/Users/example/open-swe",
-    worktreePath: null,
-    title: "Local thread",
-    viewed: true,
-    createdAt: 10,
-    updatedAt: 30,
-    modelId: "gpt-5",
-    effort: "medium",
-    ...overrides,
-  }
-}
-
-const project: DesktopProject = {
-  cwd: "/Users/example/open-swe",
-  name: "open-swe",
-  addedAt: 1,
-  scopeId: "project-open-swe",
-}
-
 describe("sidebar thread adapters", () => {
   it("uses short repository names and namespaced identities", () => {
-    const cloud = cloudSidebarThread(cloudThread())
-    const local = localSidebarThread(localThread(), project, undefined)
-
-    expect(cloud).toMatchObject({
+    expect(cloudSidebarThread(cloudThread())).toMatchObject({
       key: "cloud:same-id",
-      projectKey: "project:langchain-ai/open-swe",
-      projectLabel: "open-swe",
+      repoKey: "repo:langchain-ai/open-swe",
+      repoLabel: "open-swe",
     })
-    expect(local).toMatchObject({
-      key: "local:same-id",
-      projectKey: "project:/users/example/open-swe",
-      projectLabel: "open-swe",
-    })
-  })
-
-  it("normalizes local activity into shared statuses", () => {
-    expect(localSidebarThread(localThread(), project, "running").status).toBe(
-      "running"
-    )
-    expect(localSidebarThread(localThread(), project, "error").status).toBe(
-      "error"
-    )
-    expect(
-      localSidebarThread(localThread({ viewed: false }), project, undefined)
-        .status
-    ).toBe("finished")
-    expect(localSidebarThread(localThread(), project, undefined).status).toBe(
-      "idle"
-    )
-  })
-
-  it("merges a local checkout into the cloud project of the same name", () => {
-    const cloud = [cloudSidebarThread(cloudThread())]
-    const threads = [
-      ...cloud,
-      ...applyProjectKeyAliases(
-        [localSidebarThread(localThread(), project, undefined)],
-        cloudProjectKeysByLabel(cloud)
-      ),
-    ]
-
-    expect(sidebarProjectOptions(threads, [])).toEqual([
-      { key: "project:langchain-ai/open-swe", label: "open-swe" },
-    ])
   })
 
   it("keeps same-named repositories from different owners apart", () => {
@@ -109,33 +41,22 @@ describe("sidebar thread adapters", () => {
       cloudThread({ id: "b", repo: "api", repoFullName: "other/api" })
     )
 
-    expect(acme.projectKey).not.toBe(other.projectKey)
-    expect(sidebarProjectOptions([acme, other], [])).toHaveLength(2)
-    // The label is ambiguous, so a local "api" must not be folded into either.
-    const local = localSidebarThread(
-      localThread({ cwd: "/Users/example/api" }),
-      {
-        cwd: "/Users/example/api",
-        name: "api",
-        addedAt: 1,
-        scopeId: "project-api",
-      },
-      undefined
-    )
-    const aliases = cloudProjectKeysByLabel([acme, other])
-    expect(applyProjectKeyAliases([local], aliases)[0]?.projectKey).toBe(
-      local.projectKey
-    )
+    expect(acme.repoKey).not.toBe(other.repoKey)
   })
 })
 
 describe("sortSidebarThreads", () => {
-  it("sorts chats by creation time without moving recently updated chats", () => {
+  it("sorts chats and task families by creation or update time", () => {
     const olderUpdated = cloudSidebarThread(
       cloudThread({ id: "older-updated", createdAt: 10, updatedAt: 50 })
     )
     const newer = cloudSidebarThread(
-      cloudThread({ id: "newer", createdAt: 20, updatedAt: 20 })
+      cloudThread({
+        id: "newer",
+        createdAt: 5,
+        updatedAt: 20,
+        taskWorkers: [cloudThread({ id: "worker", createdAt: 20 })],
+      })
     )
 
     expect(
@@ -151,64 +72,52 @@ describe("sortSidebarThreads", () => {
   })
 })
 
-describe("groupSidebarThreadsByProject", () => {
-  it("buckets threads per project and ranks projects by their freshest thread", () => {
-    const alphaOld = cloudSidebarThread(
-      cloudThread({
-        id: "alpha-old",
-        repo: "alpha",
-        repoFullName: "acme/alpha",
-        updatedAt: 5,
-      })
-    )
-    const alphaNew = cloudSidebarThread(
-      cloudThread({
-        id: "alpha-new",
-        repo: "alpha",
-        repoFullName: "acme/alpha",
-        updatedAt: 40,
-      })
-    )
-    const beta = cloudSidebarThread(
-      cloudThread({
-        id: "beta",
-        repo: "beta",
-        repoFullName: "acme/beta",
-        updatedAt: 50,
-      })
-    )
-    const items = [alphaOld, alphaNew, beta]
+describe("groupRepoGroupsByWorkspace", () => {
+  it("nests repository groups under their owning workspace, defaulting the rest", () => {
+    const groups = [
+      { key: "repo:acme/alpha", label: "alpha" },
+      { key: "repo:acme/beta", label: "beta" },
+      { key: "repo:acme/gamma", label: "gamma" },
+    ]
+    const repos = [
+      { key: "repo:acme/alpha", label: "alpha", workspace: "oss" },
+      { key: "repo:acme/beta", label: "beta", workspace: "oss" },
+      // No workspace field at all: falls under "default".
+      { key: "repo:acme/gamma", label: "gamma" },
+    ]
+    const workspaces = [
+      { slug: "oss", name: "Open Source" },
+      { slug: "default", name: "Default" },
+    ]
 
-    const grouped = groupSidebarThreadsByProject(
-      items,
-      sidebarProjectOptions(items, [])
-    )
+    const grouped = groupRepoGroupsByWorkspace(groups, repos, workspaces)
 
-    expect(grouped.projects.map((group) => group.label)).toEqual([
-      "beta",
-      "alpha",
-    ])
-    expect(grouped.projects[1]?.threads.map((thread) => thread.id)).toEqual([
-      "alpha-new",
-      "alpha-old",
-    ])
-    expect(grouped.recents).toEqual([])
+    expect(
+      grouped.map((workspace) => [
+        workspace.slug,
+        workspace.name,
+        workspace.repos.map((repo) => repo.key).sort(),
+      ])
+    ).toEqual(
+      expect.arrayContaining([
+        ["oss", "Open Source", ["repo:acme/alpha", "repo:acme/beta"]],
+        ["default", "Default", ["repo:acme/gamma"]],
+      ])
+    )
+    expect(grouped).toHaveLength(2)
   })
 
-  it("sends threads with no known project to Recents", () => {
-    const orphan = cloudSidebarThread(
-      cloudThread({ id: "orphan", repo: "", repoFullName: "" })
-    )
-    const known = cloudSidebarThread(
-      cloudThread({ id: "known", repo: "alpha", repoFullName: "acme/alpha" })
-    )
+  it("falls back to the slug as a display name for an unknown workspace", () => {
+    const repos = [{ key: "repo:acme/solo", label: "solo", workspace: "ghost" }]
 
-    const grouped = groupSidebarThreadsByProject(
-      [orphan, known],
-      sidebarProjectOptions([known], [])
-    )
+    const grouped = groupRepoGroupsByWorkspace(repos, repos, [])
 
-    expect(grouped.projects).toHaveLength(1)
-    expect(grouped.recents.map((thread) => thread.id)).toEqual(["orphan"])
+    expect(grouped).toEqual([
+      {
+        slug: "ghost",
+        name: "ghost",
+        repos: [expect.objectContaining({ key: "repo:acme/solo" })],
+      },
+    ])
   })
 })

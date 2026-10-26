@@ -17,15 +17,13 @@ export function absoluteApiUrl(url: string): string {
 }
 
 /** A LangGraph client for a dashboard-proxied graph endpoint. */
-export function createDashboardClient(apiUrl: string): Client {
+export function createDashboardClient(
+  apiUrl: string,
+  fetcher: typeof fetch = dashboardFetch
+): Client {
   return new Client({
     apiUrl: absoluteApiUrl(apiUrl),
     apiKey: null,
-    callerOptions: { fetch: dashboardFetch },
+    callerOptions: { fetch: fetcher },
   })
-}
-
-/** A LangGraph client for the desktop app's local graph proxy. */
-export function createLocalGraphClient(): Client {
-  return new Client({ apiUrl: absoluteApiUrl("/local-graph"), apiKey: null })
 }

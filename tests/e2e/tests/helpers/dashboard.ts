@@ -3,8 +3,24 @@ import { expect, type Page } from "@playwright/test";
 // Shared fixtures for the specs that drive the REAL built ui/ app (served
 // same-origin from the harness). Only the LLM/GitHub/Slack/token boundaries
 // are faked.
-export const SAME_USER = { login: "alice", email: "alice@example.com" };
-export const OTHER_USER = { login: "bob", email: "bob@example.com" };
+export const SAME_USER = {
+  login: "alice",
+  email: "alice@example.com",
+  name: "Alice",
+};
+export const OTHER_USER = {
+  login: "bob",
+  email: "bob@example.com",
+  name: "Bob",
+};
+
+// The dashboard's mutating routes enforce same-origin, which a browser sets for
+// itself but APIRequestContext does not.
+const BASE_URL = `http://127.0.0.1:${process.env.E2E_PORT ?? 2024}`;
+export const SAME_ORIGIN_HEADERS = {
+  origin: BASE_URL,
+  referer: `${BASE_URL}/`,
+};
 
 export async function loginAs(
   page: Page,
@@ -12,6 +28,36 @@ export async function loginAs(
 ) {
   const res = await page.request.post("/control/login", { data: user });
   expect(res.ok()).toBeTruthy();
+}
+
+// What a message sent while a run is live does. It is the person's saved
+// preference, so a spec that depends on it sets it rather than inherit another's.
+export async function setFollowUpBehavior(
+  page: Page,
+  behavior: "queue" | "steer",
+) {
+  const saved = await page.request.get("/dashboard/api/me/preferences");
+  expect(saved.ok()).toBeTruthy();
+  const res = await page.request.put("/dashboard/api/me/preferences", {
+    data: { ...(await saved.json()), follow_up_behavior: behavior },
+    headers: SAME_ORIGIN_HEADERS,
+  });
+  expect(res.ok()).toBeTruthy();
+}
+
+export async function optIntoQueue(page: Page) {
+  await setFollowUpBehavior(page, "queue");
+}
+
+// `monitor` is off by default; the sender opts in on their profile.
+export async function enableMonitors(page: Page) {
+  const saved = await page.request.get("/dashboard/api/profile");
+  expect(saved.ok()).toBeTruthy();
+  const response = await page.request.put("/dashboard/api/profile", {
+    headers: { origin: new URL(saved.url()).origin },
+    data: { ...(await saved.json()), experimental_monitor: true },
+  });
+  expect(response.ok(), await response.text()).toBeTruthy();
 }
 
 // The composer is a rich-text editor, not a <textarea>: it carries the prompt
@@ -35,25 +81,22 @@ export async function typeIntoComposer(page: Page, text: string) {
   await editor.press("Enter");
 }
 
-// A fresh user lands on the default-model dialog, whose backdrop swallows
-// clicks on the composer behind it.
 export async function dismissOnboardingIfShown(page: Page) {
   const profile = (await (
     await page.request.get("/dashboard/api/profile")
-  ).json()) as { default_model?: string };
-  const mapping = (await (
-    await page.request.get("/dashboard/api/my-mapping")
-  ).json()) as { slack_user_id?: string };
+  ).json()) as { slack_onboarding_dismissed?: boolean };
   const session = (await (
     await page.request.get("/dashboard/api/me")
   ).json()) as {
     slack_oauth_enabled?: boolean;
+    slack_user_id?: string | null;
   };
   const needsOnboarding =
-    !profile.default_model ||
-    (session.slack_oauth_enabled && !mapping.slack_user_id);
+    session.slack_oauth_enabled &&
+    !session.slack_user_id &&
+    !profile.slack_onboarding_dismissed;
   if (!needsOnboarding) return;
-  const dismiss = page.getByRole("button", { name: "Maybe later" });
+  const dismiss = page.getByRole("button", { name: "Don't ask again" });
   await expect(dismiss).toBeVisible();
   await dismiss.click();
   await expect(dismiss).toBeHidden();
@@ -140,6 +183,8 @@ export interface SeedPullRequestOptions {
   reviews?: FakeReview[];
   review_threads?: FakeReviewThread[];
   review_decision?: "APPROVED" | "CHANGES_REQUESTED" | "REVIEW_REQUIRED";
+  // Committed to `head` off the base branch, so the PR carries a real diff.
+  files?: Record<string, string>;
 }
 
 export interface SeededPullRequest {
@@ -278,6 +323,27 @@ export async function openMultiRepoPrThreadViaSlackLink(page: Page) {
   await expect(page).toHaveURL(/\/agents\//);
 }
 
+// Every call the backend planned the thread's runs for, once its runs are done. The
+// harness answers each call as a replica that never served the run (patches.py).
+export async function plannedCalls(page: Page, threadId: string) {
+  await expect
+    .poll(
+      async () => {
+        const res = await page.request.get(
+          `${BASE_URL}/control/thread-idle?thread_id=${threadId}`,
+        );
+        return ((await res.json()) as { idle: boolean }).idle;
+      },
+      { timeout: 30_000, intervals: [500] },
+    )
+    .toBe(true);
+  const res = await page.request.get(
+    `${BASE_URL}/control/plans?thread_id=${threadId}`,
+  );
+  expect(res.ok()).toBeTruthy();
+  return (await res.json()) as string[];
+}
+
 export function threadIdFromUrl(page: Page): string {
   const id = new URL(page.url()).pathname.split("/").pop() ?? "";
   expect(id).not.toBe("");
@@ -288,7 +354,10 @@ export async function expectTranscriptVisible(page: Page) {
   await expect(async () => {
     await page.reload();
     await expect(
-      page.getByRole("link", { name: "Add greet() helper" }).first(),
+      page
+        .getByRole("main")
+        .getByRole("link", { name: "Add greet() helper", exact: true })
+        .first(),
     ).toBeVisible({ timeout: 8000 });
   }).toPass({ timeout: 60000 });
 }

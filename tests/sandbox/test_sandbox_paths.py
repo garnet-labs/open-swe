@@ -3,7 +3,8 @@ from typing import cast
 
 from deepagents.backends.protocol import ExecuteResponse, SandboxBackendProtocol
 
-from agent.sandboxes.paths import resolve_repo_dir, resolve_sandbox_work_dir
+from openswe.sandboxes.lifecycle import configure_git_identity
+from openswe.sandboxes.paths import resolve_repo_dir, resolve_sandbox_work_dir
 
 
 class _FakeProvider:
@@ -90,27 +91,37 @@ async def test_resolve_sandbox_work_dir_falls_back_to_home_when_work_dir_is_not_
     ]
 
 
-async def test_resolve_sandbox_work_dir_caches_the_result() -> None:
-    backend = _FakeSandboxBackend(
-        provider=_FakeProvider(work_dir="/workspace"),
-        writable_dirs={"/workspace"},
+class _IdentityBackend(_FakeSandboxBackend):
+    """Answers the git identity write, which also readies the provider's work dir."""
+
+    async def aexecute(self, command: str, *, timeout: int | None = None) -> ExecuteResponse:
+        if "git config --global" not in command:
+            return await super().aexecute(command, timeout=timeout)
+        self.commands.append(command)
+        ready = "/workspace" in self.writable_dirs
+        return ExecuteResponse(
+            output="__open_swe_work_dir_ready__\n" if ready else "", exit_code=0, truncated=False
+        )
+
+
+async def test_the_identity_write_readies_the_work_dir_so_no_probe_follows() -> None:
+    backend = _IdentityBackend(
+        provider=_FakeProvider(work_dir="/workspace"), writable_dirs={"/workspace"}
     )
 
-    first = await resolve_sandbox_work_dir(cast(SandboxBackendProtocol, backend))
-    second = await resolve_sandbox_work_dir(cast(SandboxBackendProtocol, backend))
+    await configure_git_identity(cast(SandboxBackendProtocol, backend))
 
-    assert first == "/workspace"
-    assert second == "/workspace"
-    assert backend.commands == ["test -d /workspace && test -w /workspace"]
+    assert await resolve_sandbox_work_dir(cast(SandboxBackendProtocol, backend)) == "/workspace"
+    assert len(backend.commands) == 1
 
 
-async def test_resolve_repo_dir_resolves_home_dir() -> None:
-    backend = _FakeSandboxBackend(
-        provider=_FakeProvider(work_dir="/home/daytona"),
+async def test_a_work_dir_the_identity_write_could_not_ready_is_still_probed() -> None:
+    backend = _IdentityBackend(
+        provider=_FakeProvider(work_dir="/workspace", home_dir="/home/daytona"),
+        shell_paths={"pwd": "/workspace", "printf '%s' \"$HOME\"": "/home/daytona"},
         writable_dirs={"/home/daytona"},
     )
 
-    repo_dir = await resolve_repo_dir(cast(SandboxBackendProtocol, backend), "open-swe")
+    await configure_git_identity(cast(SandboxBackendProtocol, backend))
 
-    assert repo_dir == "/home/daytona/open-swe"
-    assert backend.commands == ["test -d /home/daytona && test -w /home/daytona"]
+    assert await resolve_sandbox_work_dir(cast(SandboxBackendProtocol, backend)) == "/home/daytona"

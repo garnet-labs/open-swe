@@ -1,6 +1,12 @@
+import { toast } from "sonner"
+
+import { formatCost } from "@/features/agents/lib/contextUsage"
+
 type MessageTimestampProps = {
   timestamp: string
   startedAt?: string
+  /** Cost of the run that produced this turn, shown after the time. */
+  costUsd?: number
   align?: "left" | "right"
   className?: string
 }
@@ -47,6 +53,7 @@ function shortTimestamp(date: Date): string {
 export function MessageTimestamp({
   timestamp,
   startedAt,
+  costUsd,
   align = "left",
   className = "",
 }: MessageTimestampProps) {
@@ -63,13 +70,25 @@ export function MessageTimestamp({
     <div
       className={`flex ${align === "right" ? "justify-end" : "justify-start"} ${className}`}
     >
-      <time
-        dateTime={date.toISOString()}
-        title={title}
-        className="text-[11px] leading-4 text-muted-foreground/70 tabular-nums opacity-0 transition-opacity duration-200 select-none group-hover/turn:opacity-100"
+      <button
+        type="button"
+        aria-label={`Copy timestamp: ${title}`}
+        title={`${title} · Click to copy`}
+        onClick={async () => {
+          try {
+            await navigator.clipboard.writeText(date.toISOString())
+            toast.success("Timestamp copied")
+          } catch {
+            toast.error(
+              "Unable to copy timestamp. Check clipboard permissions."
+            )
+          }
+        }}
+        className="cursor-pointer rounded-xs text-xxs leading-4 text-tertiary tabular-nums opacity-0 transition-opacity duration-normal select-none group-hover/turn:opacity-100 hover:text-primary focus-visible:opacity-100 focus-visible:ring-2 focus-visible:ring-focus focus-visible:outline-none"
       >
-        {shortTimestamp(date)}
-      </time>
+        <time dateTime={date.toISOString()}>{shortTimestamp(date)}</time>
+        {costUsd != null && ` · ${formatCost(costUsd)}`}
+      </button>
     </div>
   )
 }

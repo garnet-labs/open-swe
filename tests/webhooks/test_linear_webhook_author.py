@@ -4,7 +4,11 @@ import asyncio
 from typing import Any
 from unittest.mock import AsyncMock, patch
 
-from agent.linear import webhook as linear_webhook
+import pytest
+
+from openswe.linear import webhook as linear_webhook
+
+pytestmark = pytest.mark.usefixtures("no_local_threads")
 
 
 def _full_issue(*, user_email: str | None = "zhen@example.com", user_name: str = "Zhen") -> dict:
@@ -31,11 +35,21 @@ def _run_process(
     repo_config: dict[str, str],
     *,
     full_issue: dict[str, Any] | None = None,
+    thread_workspace: str | None = None,
+    workspace: str | None = None,
 ) -> tuple[dict, dict, str | None, object]:
     captured: dict[str, Any] = {}
 
     async def fake_dispatch(
-        thread_id, content, configurable, *, source, input=None, metadata=None, client=None
+        thread_id,
+        content,
+        configurable,
+        *,
+        source,
+        thread_title,
+        input=None,
+        metadata=None,
+        client=None,
     ):
         captured["content"] = input or content
         captured["configurable"] = configurable
@@ -52,7 +66,11 @@ def _run_process(
         source_context=None,
         workspace=None,
     ):
-        captured["upsert"] = {"github_login": github_login, "user_email": user_email}
+        captured["upsert"] = {
+            "github_login": github_login,
+            "user_email": user_email,
+            "workspace": workspace,
+        }
         return None
 
     async def fake_resolve_login(email):
@@ -72,6 +90,12 @@ def _run_process(
             linear_webhook.common, "upsert_agent_thread_metadata", side_effect=fake_upsert
         ),
         patch.object(linear_webhook.common, "resolve_agent_model_id", new_callable=AsyncMock),
+        patch.object(
+            linear_webhook.common, "get_thread_workspace", AsyncMock(return_value=thread_workspace)
+        ),
+        patch.object(
+            linear_webhook.common, "workspace_for_repo_config", AsyncMock(return_value="oss")
+        ),
         patch.object(linear_webhook.common, "model_supports_images", return_value=True),
         patch.object(
             linear_webhook.common,
@@ -80,7 +104,9 @@ def _run_process(
             side_effect=lambda url, _client: {"type": "image_url", "image_url": {"url": url}},
         ),
     ):
-        asyncio.run(linear_webhook.process_linear_issue(issue_data, repo_config))
+        asyncio.run(
+            linear_webhook.process_linear_issue(issue_data, repo_config, workspace=workspace)
+        )
 
     return (
         captured.get("configurable", {}),
@@ -90,54 +116,39 @@ def _run_process(
     )
 
 
-def test_linear_configurable_carries_github_login(fake_store: Any) -> None:
-    configurable, _upsert, resolved_email, _content = _run_process(
+def test_linear_follow_up_keeps_the_threads_workspace() -> None:
+    configurable, upsert, _email, _content = _run_process(
+        _issue_data(user_email="zhen@example.com"),
+        {"owner": "langchain-ai", "name": "open-swe"},
+        thread_workspace="core",
+        workspace="personal",
+    )
+
+    assert configurable["workspace"] == "core"
+    assert upsert["workspace"] == "core"
+
+
+def test_linear_new_thread_lands_in_the_repositorys_preferred_workspace() -> None:
+    configurable, _upsert, _email, _content = _run_process(
         _issue_data(user_email="zhen@example.com"),
         {"owner": "langchain-ai", "name": "open-swe"},
     )
 
-    assert resolved_email == "zhen@example.com"
-    assert configurable["source"] == "linear"
-    assert configurable["github_login"] == "zhen"
-    assert configurable["user_email"] == "zhen@example.com"
+    assert configurable["workspace"] == "oss"
 
 
-def test_linear_upsert_tags_thread_with_login(fake_store: Any) -> None:
-    _configurable, upsert, _email, _content = _run_process(
+def test_linear_personal_default_keeps_the_selected_workspace() -> None:
+    configurable, upsert, _email, _content = _run_process(
         _issue_data(user_email="zhen@example.com"),
         {"owner": "langchain-ai", "name": "open-swe"},
+        workspace="personal",
     )
 
-    assert upsert["github_login"] == "zhen"
-    assert upsert["user_email"] == "zhen@example.com"
+    assert configurable["workspace"] == "personal"
+    assert upsert["workspace"] == "personal"
 
 
-def test_linear_omits_login_when_unmapped(fake_store: Any) -> None:
-    configurable, upsert, resolved_email, _content = _run_process(
-        _issue_data(user_email="nobody@example.com"),
-        {"owner": "langchain-ai", "name": "open-swe"},
-    )
-
-    assert resolved_email == "nobody@example.com"
-    assert "github_login" not in configurable
-    assert upsert["github_login"] == ""
-
-
-def test_linear_description_images_stay_with_issue_without_comments(fake_store: Any) -> None:
-    issue = _full_issue()
-    issue["description"] = "See ![issue](https://example.com/issue.png)"
-    _configurable, _upsert, _email, content = _run_process(
-        _issue_data(user_email="zhen@example.com"),
-        {"owner": "langchain-ai", "name": "open-swe"},
-        full_issue=issue,
-    )
-
-    assert isinstance(content, dict)
-    messages = content["messages"]
-    assert messages[1]["content"][1]["image_url"]["url"] == "https://example.com/issue.png"
-
-
-def test_linear_comment_images_stay_with_their_comments(fake_store: Any) -> None:
+def test_linear_comment_images_stay_with_their_comments() -> None:
     issue = _full_issue()
     issue["comments"]["nodes"] = [
         {

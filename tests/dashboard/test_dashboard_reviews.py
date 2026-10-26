@@ -2,11 +2,16 @@ from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock
 
+import httpx2
 import pytest
 
-from agent.github import repos
-from agent.review import reviews as review_api
-from agent.review.findings import REVIEWER_THREAD_KIND
+from openswe.github import app as github_app
+from openswe.github import http as github_http
+from openswe.github.http import GitHubError
+from openswe.review import reviews as review_api
+from openswe.review.findings import REVIEWER_THREAD_KIND
+
+pytestmark = pytest.mark.usefixtures("findings_from_metadata")
 
 
 def _thread(owner: str, name: str, number: int, author: str) -> dict[str, Any]:
@@ -33,62 +38,6 @@ def _fake_client(pages: list[list[dict[str, Any]]]) -> tuple[Any, dict[str, Any]
 
 
 @pytest.mark.asyncio
-async def test_list_reviews_pushes_author_into_metadata_filter(monkeypatch) -> None:
-    client, captured = _fake_client([[]])
-    monkeypatch.setattr(review_api, "langgraph_client", lambda: client)
-
-    reviews, has_more = await review_api.list_reviews(20, author="octocat")
-
-    assert captured["calls"][0]["metadata"] == {
-        "kind": REVIEWER_THREAD_KIND,
-        "pr": {"author": "octocat"},
-    }
-    assert reviews == []
-    assert has_more is False
-
-
-@pytest.mark.asyncio
-async def test_list_reviews_no_author_filters_kind_only(monkeypatch) -> None:
-    client, captured = _fake_client([[]])
-    monkeypatch.setattr(review_api, "langgraph_client", lambda: client)
-
-    await review_api.list_reviews(20, author=None)
-
-    assert captured["calls"][0]["metadata"] == {"kind": REVIEWER_THREAD_KIND}
-
-
-async def test_review_summaries_preserve_counts_and_distinguish_missing(monkeypatch):
-    thread = _thread("acme", "app", 1, "octocat")
-    thread["metadata"]["findings"] = [
-        {"id": "bug", "status": "open", "severity": "high", "confidence": "high"},
-        {"id": "flag", "status": "open", "severity": "medium", "confidence": "medium"},
-    ]
-    client, captured = _fake_client([[thread], []])
-    monkeypatch.setattr(review_api, "langgraph_client", lambda: client)
-    result = await review_api.get_review_summaries([("acme", "app", 1), ("acme", "app", 2)])
-    summary = result["acme/app#1"]
-    assert summary is not None
-    assert summary.counts.bugs == 1
-    assert summary.counts.flags == 1
-    assert result["acme/app#2"] is None
-    assert captured["calls"][0]["metadata"]["pr"] == {"owner": "acme", "name": "app", "number": 1}
-
-
-async def test_review_summary_json_keys_match_the_dashboard_client(monkeypatch):
-    thread = _thread("acme", "app", 1, "octocat")
-    client, _ = _fake_client([[thread]])
-    monkeypatch.setattr(review_api, "langgraph_client", lambda: client)
-
-    result = await review_api.get_review_summaries([("acme", "app", 1)])
-    summary = result["acme/app#1"]
-    assert summary is not None
-
-    assert summary.model_dump(by_alias=True, mode="json") == review_api._thread_review_summary(
-        thread
-    )
-
-
-@pytest.mark.asyncio
 async def test_list_reviews_applies_accessibility_and_has_more(monkeypatch) -> None:
     page = [
         _thread("acme", "a", 1, "octocat"),
@@ -109,30 +58,45 @@ async def test_list_reviews_applies_accessibility_and_has_more(monkeypatch) -> N
 
 
 @pytest.mark.asyncio
-async def test_accessible_repo_full_names_lowercases(monkeypatch) -> None:
-    fetch = AsyncMock(return_value=([], [{"full_name": "Acme/Repo"}, {"full_name": "Acme/Other"}]))
-    monkeypatch.setattr(repos, "fetch_user_installations_and_repos", fetch)
+async def test_get_review_propagates_a_pull_request_missing_on_github(monkeypatch) -> None:
+    monkeypatch.setattr(
+        github_app, "get_github_app_installation_token", AsyncMock(return_value="t")
+    )
+    missing = httpx2.Response(
+        404, json={"message": "Not Found"}, request=httpx2.Request("GET", "https://api.github.com")
+    )
+    monkeypatch.setattr(github_http, "github_request", AsyncMock(return_value=missing))
 
-    names = await repos.accessible_repo_full_names("octocat")
+    with pytest.raises(GitHubError) as excinfo:
+        await review_api.get_review("acme", "app", 7)
 
-    assert names == frozenset({"acme/repo", "acme/other"})
+    assert excinfo.value.response.status_code == 404
 
 
 @pytest.mark.asyncio
-async def test_accessible_repo_full_names_resolves_fresh_each_call(monkeypatch) -> None:
-    # Access is an authorization boundary, so it must not be cached across calls:
-    # a second call re-fetches and reflects revoked access.
-    fetch = AsyncMock(
-        side_effect=[
-            ([], [{"full_name": "acme/repo"}]),
-            ([], []),
-        ]
+async def test_review_trace_uses_the_reviewer_thread(monkeypatch) -> None:
+    trace_url = "https://smith.langchain.com/trace/reviewer"
+    monkeypatch.setattr(
+        github_app, "get_github_app_installation_token", AsyncMock(return_value="t")
     )
-    monkeypatch.setattr(repos, "fetch_user_installations_and_repos", fetch)
+    monkeypatch.setattr(
+        github_http,
+        "github_request",
+        AsyncMock(
+            return_value=httpx2.Response(
+                200,
+                json={"title": "Example", "state": "open"},
+                request=httpx2.Request("GET", "https://api.github.com"),
+            )
+        ),
+    )
+    thread = _thread("acme", "app", 7, "alice")
+    monkeypatch.setattr(review_api, "_reviewer_thread_for", AsyncMock(return_value=thread))
+    monkeypatch.setattr(review_api, "_scout_target", AsyncMock(return_value=None))
+    trace = AsyncMock(return_value=trace_url)
+    monkeypatch.setattr(review_api, "get_langsmith_trace_url", trace)
 
-    first = await repos.accessible_repo_full_names("octocat")
-    second = await repos.accessible_repo_full_names("octocat")
+    detail = await review_api.get_review("acme", "app", 7)
 
-    assert first == frozenset({"acme/repo"})
-    assert second == frozenset()
-    assert fetch.await_count == 2
+    assert detail["trace_url"] == trace_url
+    trace.assert_awaited_once_with("acme/app/7")

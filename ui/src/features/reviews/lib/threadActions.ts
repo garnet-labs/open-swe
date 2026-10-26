@@ -11,7 +11,6 @@ export interface ThreadActionLabels {
   running: string
   checking: string
   unavailable: string
-  queuing: string
   queued: string
   retry: string
 }
@@ -33,17 +32,16 @@ export const threadActions: Record<PullRequestThreadActionName, ThreadAction> =
     fix: {
       labels: {
         idle: "Fix",
-        running: "Fix in progress",
+        running: "Fixing",
         checking: "Checking…",
         unavailable: "Fix unavailable",
-        queuing: "Queuing fix…",
         queued: "Fix queued",
         retry: "Retry fix",
       },
       toasts: {
         queued: "Fix queued for",
-        running: "Fix already in progress for",
-        failed: "Could not queue fix for",
+        running: "Already fixing",
+        failed: "Could not queue a fix for",
       },
       run: (pr) => api.fixPullRequest(pr),
     },
@@ -53,7 +51,6 @@ export const threadActions: Record<PullRequestThreadActionName, ThreadAction> =
         running: "Addressing comments",
         checking: "Checking…",
         unavailable: "Address comments unavailable",
-        queuing: "Queuing comment fixes…",
         queued: "Comment fixes queued",
         retry: "Retry address comments",
       },
