@@ -1,5 +1,7 @@
 import type { RumInitConfiguration } from "@datadog/browser-rum"
 
+import { dashboardApiBase } from "./api-base"
+
 type PublicEnv = Record<string, string | boolean | undefined>
 type RumClient = {
   init: (configuration: RumInitConfiguration) => void
@@ -14,6 +16,10 @@ type RumClient = {
     }
   ) => void
   setGlobalContextProperty?: (key: string, value: string) => void
+  addError?: (
+    error: unknown,
+    context?: Record<string, string | number | null>
+  ) => void
 }
 type RumLoader = () => Promise<RumClient>
 
@@ -70,15 +76,13 @@ export function subscribeToDatadogInitialization(
 function templateDashboardPath(pathname: string): string {
   if (/^\/agents\/reviews\/[^/]+\/[^/]+\/[^/]+\/?$/.test(pathname))
     return "/agents/reviews/:owner/:repo/:number"
-  if (/^\/agents\/local\/[^/]+\/?$/.test(pathname))
-    return "/agents/local/:sessionId"
   if (/^\/agents\/automations\/(?!new\/?$)[^/]+\/?$/.test(pathname))
     return "/agents/automations/:scheduleId"
   if (/^\/agents\/[^/]+\/plan\/?$/.test(pathname))
     return "/agents/:threadId/plan"
   if (
     /^\/agents\/[^/]+\/?$/.test(pathname) &&
-    !/^\/agents\/(automations|instructions|local|reviews|sandbox|skills|threads|workspaces)\/?$/.test(
+    !/^\/agents\/(automations|instructions|reviews|sandbox|skills|threads|workspaces)\/?$/.test(
       pathname
     )
   )
@@ -164,6 +168,33 @@ export async function initializeDatadogRum(
   if (!applicationId || !clientToken) return
 
   const version = envString(env, "VITE_DATADOG_VERSION")
+  let environment: string
+  try {
+    const response = await fetch(
+      `${dashboardApiBase()}/dashboard/api/analytics/config`,
+      { cache: "no-store", signal: AbortSignal.timeout(5000) }
+    )
+    if (!response.ok) {
+      throw new Error(`Telemetry configuration: ${response.status}`)
+    }
+    const config: unknown = await response.json()
+    if (
+      typeof config !== "object" ||
+      config === null ||
+      !("environment" in config) ||
+      typeof config.environment !== "string" ||
+      !config.environment.trim()
+    ) {
+      throw new Error("Telemetry environment is missing")
+    }
+    environment = config.environment
+  } catch (error) {
+    console.warn(
+      "Datadog initialization skipped: telemetry configuration unavailable",
+      error
+    )
+    return
+  }
   const rum = await loadRum().catch(() => undefined)
   if (!rum) return
 
@@ -179,10 +210,7 @@ export async function initializeDatadogRum(
     clientToken,
     site: site as RumInitConfiguration["site"],
     service: envString(env, "VITE_DATADOG_SERVICE") ?? "open-swe-dashboard",
-    env:
-      envString(env, "VITE_DATADOG_ENV") ??
-      envString(env, "MODE") ??
-      "production",
+    env: environment,
     ...(version ? { version } : {}),
     sessionSampleRate: sampleRate(env, "VITE_DATADOG_SESSION_SAMPLE_RATE", 100),
     sessionReplaySampleRate: replaySampleRate(env),

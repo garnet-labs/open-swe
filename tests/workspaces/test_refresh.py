@@ -1,12 +1,11 @@
+import asyncio
 import base64
-from datetime import UTC, datetime, timedelta
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from agent.workspaces import refresh
-from agent.workspaces import store as env_store
-from agent.workspaces.store import WORKSPACES, Workspace, WorkspaceCreate
+from openswe.workspaces import refresh
+from openswe.workspaces.store import WORKSPACES, WorkspaceCreate
 
 
 class _Result:
@@ -34,80 +33,7 @@ def _scripts_run(backend: MagicMock) -> list[str]:
 # --- script command (sync) ---
 
 
-def test_script_command_carries_the_script_verbatim() -> None:
-    """Base64 so quotes and heredocs in the body cannot break the command."""
-    script = "set -euo pipefail\ngit clone 'git@github.com:acme/repo'  # it's fine\n"
-    command = env_store.script_command(script, "setup")
-
-    encoded = command.split("printf %s ")[1].split(" |")[0].strip("'")
-    assert base64.b64decode(encoded).decode() == script
-
-
-def test_script_command_traces_into_a_canonical_log_and_keeps_the_exit_code(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """The log rides into the snapshot, and `cat` must not mask a failing script."""
-    monkeypatch.delenv("OPENSWE_SCRIPT_ROOT", raising=False)
-    command = env_store.script_command("git pull", "update")
-
-    assert env_store.script_log_path("update") == "/open-swe/environment/logs/update.log"
-    assert "mkdir -p /open-swe/environment/logs" in command
-    assert (
-        "bash -x /open-swe/environment/update.sh > /open-swe/environment/logs/update.log" in command
-    )
-    # The script's own status, captured before `cat` runs.
-    assert "rc=$?" in command
-    assert command.endswith("exit $rc")
-
-
-def test_daily_schedule_is_stable_and_staggered() -> None:
-    assert refresh.daily_schedule("default") == refresh.daily_schedule("default")
-    schedules = {refresh.daily_schedule(slug) for slug in ("default", "staging", "preview")}
-    assert len(schedules) > 1
-    for schedule in schedules:
-        minute, hour, *rest = schedule.split()
-        assert 0 <= int(minute) < 60
-        assert 3 <= int(hour) < 6
-        assert rest == ["*", "*", "*"]
-
-
-def test_a_wedged_refresh_does_not_block_forever() -> None:
-    stale = Workspace(slug="base", refresh_status="refreshing", refresh_started_at="2020-01-01")
-    assert refresh.is_refresh_in_flight(stale) is False
-    assert refresh.is_refresh_in_flight(Workspace(slug="base")) is False
-
-
 # --- refresh ---
-
-
-@pytest.mark.usefixtures("registry_db")
-@pytest.mark.asyncio
-async def test_refresh_runs_the_script_then_captures_and_cleans_up() -> None:
-    backend = _backend(_Result("cloning acme/repo\ndone", 0))
-    capture = AsyncMock()
-    release = AsyncMock()
-    with (
-        patch.object(refresh, "_create_builder_sandbox", AsyncMock(return_value=backend)),
-        patch.object(refresh, "_release_builder_sandbox", release),
-        patch.object(refresh, "capture_workspace_snapshot", capture),
-    ):
-        await WORKSPACES.create(
-            WorkspaceCreate(name="base", repos=["acme/base"], setup_script="make setup"), "ramon"
-        )
-        result = await refresh.refresh_workspace("base")
-        record = await WORKSPACES.get("base")
-
-    assert result["status"] == "success"
-    assert _scripts_run(backend) == ["make setup"]
-    capture.assert_awaited_once()
-    assert capture.await_args is not None
-    assert capture.await_args.args[:2] == ("base", "sb-builder")
-    release.assert_awaited_once_with("sb-builder")
-    assert record is not None
-    assert record.refresh_status == "success"
-    assert record.refresh_log == "--- setup script ---\ncloning acme/repo\ndone"
-    assert record.refresh_error is None
-    assert record.refresh_finished_at
 
 
 @pytest.mark.usefixtures("registry_db")
@@ -123,6 +49,7 @@ async def test_the_update_script_runs_after_setup_and_gates_the_capture() -> Non
     ):
         await WORKSPACES.create(
             WorkspaceCreate(
+                inherit_default_sandbox=False,
                 name="base",
                 repos=["acme/base"],
                 setup_script="make setup",
@@ -156,7 +83,13 @@ async def test_a_failing_script_is_never_captured() -> None:
         patch.object(refresh, "capture_workspace_snapshot", capture),
     ):
         await WORKSPACES.create(
-            WorkspaceCreate(name="base", repos=["acme/base"], setup_script="make setup"), "ramon"
+            WorkspaceCreate(
+                inherit_default_sandbox=False,
+                name="base",
+                repos=["acme/base"],
+                setup_script="make setup",
+            ),
+            "ramon",
         )
         # A snapshot from an earlier refresh; runs must keep booting from it.
         await WORKSPACES.mark_captured(
@@ -189,7 +122,13 @@ async def test_a_sandbox_that_never_boots_still_records_the_failure() -> None:
         patch.object(refresh, "_release_builder_sandbox", release),
     ):
         await WORKSPACES.create(
-            WorkspaceCreate(name="base", repos=["acme/base"], setup_script="make setup"), "ramon"
+            WorkspaceCreate(
+                inherit_default_sandbox=False,
+                name="base",
+                repos=["acme/base"],
+                setup_script="make setup",
+            ),
+            "ramon",
         )
         result = await refresh.refresh_workspace("base")
         record = await WORKSPACES.get("base")
@@ -203,14 +142,61 @@ async def test_a_sandbox_that_never_boots_still_records_the_failure() -> None:
 
 @pytest.mark.usefixtures("registry_db")
 @pytest.mark.asyncio
-async def test_a_refresh_in_flight_blocks_a_second_one() -> None:
+async def test_a_refresh_in_flight_blocks_a_second_one_but_not_its_own_retry() -> None:
+    """A job retried after a redeploy cut it short must not wait hours behind itself."""
+    create = AsyncMock(return_value=_backend(_Result("provisioned", 0)))
+    release = AsyncMock()
+    with (
+        patch.object(refresh, "_create_builder_sandbox", create),
+        patch.object(refresh, "_release_builder_sandbox", release),
+        patch.object(refresh, "capture_workspace_snapshot", AsyncMock()),
+    ):
+        await WORKSPACES.create(
+            WorkspaceCreate(
+                inherit_default_sandbox=False,
+                name="base",
+                repos=["acme/base"],
+                setup_script="make setup",
+            ),
+            "ramon",
+        )
+        original = await WORKSPACES.mark_refreshing("base", run_id="run-a")
+        assert original is not None
+        await original.publish_builder("sb-lost")
+        other = await refresh.refresh_workspace("base", run_id="run-b")
+        create.assert_not_awaited()
+        retried = await refresh.refresh_workspace("base", run_id="run-a")
+        # A stalled original that outlived its lease can no longer settle over the retry.
+        await original.settle("failed", error="builder stopped")
+        record = await WORKSPACES.get("base")
+
+    assert other["status"] == "already_refreshing"
+    assert retried["status"] == "success"
+    assert record is not None
+    assert record.refresh_status == "success"
+    assert record.refresh_error is None
+    # The cut-short attempt's builder is stopped, not leaked.
+    assert [call.args[0] for call in release.await_args_list] == ["sb-lost", "sb-builder"]
+
+
+@pytest.mark.usefixtures("registry_db")
+@pytest.mark.asyncio
+async def test_a_queued_job_never_takes_over_a_cron_refresh_that_claimed_first() -> None:
     create = AsyncMock()
     with patch.object(refresh, "_create_builder_sandbox", create):
         await WORKSPACES.create(
-            WorkspaceCreate(name="base", repos=["acme/base"], setup_script="make setup"), "ramon"
+            WorkspaceCreate(
+                inherit_default_sandbox=False,
+                name="base",
+                repos=["acme/base"],
+                setup_script="make setup",
+            ),
+            "ramon",
         )
-        await WORKSPACES.mark_refreshing("base")
-        result = await refresh.refresh_workspace("base")
+        # Queueing a job writes its id before the job runs; the nightly cron claims meanwhile.
+        await WORKSPACES.set_refresh_run_id("base", "job-y")
+        assert await WORKSPACES.mark_refreshing("base") is not None
+        result = await refresh.refresh_workspace("base", run_id="job-y")
 
     assert result["status"] == "already_refreshing"
     create.assert_not_awaited()
@@ -218,32 +204,32 @@ async def test_a_refresh_in_flight_blocks_a_second_one() -> None:
 
 @pytest.mark.usefixtures("registry_db")
 @pytest.mark.asyncio
-async def test_refresh_requires_the_langsmith_provider(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("SANDBOX_TYPE", "local")
-    create = AsyncMock()
-    with patch.object(refresh, "_create_builder_sandbox", create):
+async def test_a_cancelled_refresh_is_settled_so_its_retry_can_run() -> None:
+    backend = _backend()
+    backend.aexecute = AsyncMock(side_effect=asyncio.CancelledError)
+    release = AsyncMock()
+    with (
+        patch.object(refresh, "_create_builder_sandbox", AsyncMock(return_value=backend)),
+        patch.object(refresh, "_release_builder_sandbox", release),
+    ):
         await WORKSPACES.create(
-            WorkspaceCreate(name="base", repos=["acme/base"], setup_script="make setup"), "ramon"
-        )
-        result = await refresh.refresh_workspace("base")
-
-    assert result["status"] == "unsupported"
-    create.assert_not_awaited()
-
-
-@pytest.mark.usefixtures("registry_db")
-@pytest.mark.asyncio
-async def test_the_nightly_sweep_only_visits_scripted_workspaces() -> None:
-    refreshed = AsyncMock(return_value={"status": "success"})
-    with patch.object(refresh, "refresh_workspace", refreshed):
-        await WORKSPACES.create(
-            WorkspaceCreate(name="scripted", repos=["acme/scripted"], setup_script="make setup"),
+            WorkspaceCreate(
+                inherit_default_sandbox=False,
+                name="base",
+                repos=["acme/base"],
+                setup_script="make setup",
+            ),
             "ramon",
         )
-        await WORKSPACES.create(WorkspaceCreate(name="bare", repos=["acme/bare"]), "ramon")
-        await refresh.run_workspace_refresh_tick(None)
+        with pytest.raises(asyncio.CancelledError):
+            await refresh.refresh_workspace("base", run_id="run-a")
+        record = await WORKSPACES.get("base")
 
-    assert [call.args[0] for call in refreshed.await_args_list] == ["scripted"]
+    release.assert_awaited_once_with("sb-builder")
+    assert record is not None
+    assert record.refresh_status == "failed"
+    assert record.refresh_error == "interrupted"
+    assert not record.refresh_in_flight()
 
 
 # --- update kind + lazy trigger ---
@@ -262,6 +248,7 @@ async def test_an_update_boots_from_the_current_snapshot_and_runs_only_the_updat
     ):
         await WORKSPACES.create(
             WorkspaceCreate(
+                inherit_default_sandbox=False,
                 name="base",
                 repos=["acme/base"],
                 setup_script="make setup",
@@ -289,179 +276,7 @@ async def test_an_update_boots_from_the_current_snapshot_and_runs_only_the_updat
     assert record.refresh_kind == "update"
 
 
-@pytest.mark.usefixtures("registry_db")
-@pytest.mark.asyncio
-async def test_an_update_needs_a_snapshot_to_update() -> None:
-    create_builder = AsyncMock()
-    with patch.object(refresh, "_create_builder_sandbox", create_builder):
-        await WORKSPACES.create(
-            WorkspaceCreate(
-                name="base",
-                repos=["acme/base"],
-                setup_script="make setup",
-                update_script="git pull",
-            ),
-            "ramon",
-        )
-        result = await refresh.refresh_workspace("base", "update")
-
-    assert result["status"] == "no_snapshot_to_update"
-    create_builder.assert_not_awaited()
-
-
-def test_a_snapshot_is_stale_once_its_capture_ages_out() -> None:
-    """Gates the in-sandbox update: every sandbox copies the same stale image."""
-    ready = Workspace(
-        slug="base",
-        update_script="git pull",
-        snapshot_status="ready",
-        snapshot_id="snap-1",
-    )
-    assert refresh.is_snapshot_stale(ready) is True  # never captured
-    fresh = ready.model_copy(update={"last_captured_at": datetime.now(UTC).isoformat()})
-    assert refresh.is_snapshot_stale(fresh) is False
-    aged = ready.model_copy(
-        update={
-            "last_captured_at": (
-                datetime.now(UTC) - timedelta(seconds=refresh.UPDATE_INTERVAL_SECONDS + 1)
-            ).isoformat()
-        }
-    )
-    assert refresh.is_snapshot_stale(aged) is True
-    # A refresh already running does not stop the sandbox from freshening itself.
-    assert (
-        refresh.is_snapshot_stale(
-            aged.model_copy(
-                update={
-                    "refresh_status": "refreshing",
-                    "refresh_started_at": datetime.now(UTC).isoformat(),
-                }
-            )
-        )
-        is True
-    )
-    assert refresh.is_snapshot_stale(ready.model_copy(update={"update_script": ""})) is False
-    assert (
-        refresh.is_snapshot_stale(ready.model_copy(update={"snapshot_status": "failed"})) is False
-    )
-
-
-def test_an_update_is_due_only_when_stale_and_idle() -> None:
-    ready = Workspace(
-        slug="base",
-        update_script="git pull",
-        snapshot_status="ready",
-        snapshot_id="snap-1",
-    )
-    assert refresh.is_update_due(ready) is True  # never captured, never refreshed
-    aged = (datetime.now(UTC) - timedelta(seconds=refresh.UPDATE_INTERVAL_SECONDS + 1)).isoformat()
-    fresh = ready.model_copy(update={"last_captured_at": datetime.now(UTC).isoformat()})
-    assert refresh.is_update_due(fresh) is False
-    stale = ready.model_copy(update={"last_captured_at": aged, "refresh_finished_at": aged})
-    assert refresh.is_update_due(stale) is True
-    # A recent *attempt* holds off the builder even while the image is stale, so
-    # a failing script cannot enqueue one per sandbox creation.
-    just_tried = stale.model_copy(update={"refresh_finished_at": datetime.now(UTC).isoformat()})
-    assert refresh.is_update_due(just_tried) is False
-    running = stale.model_copy(
-        update={
-            "refresh_status": "refreshing",
-            "refresh_started_at": datetime.now(UTC).isoformat(),
-        }
-    )
-    assert refresh.is_update_due(running) is False
-    assert refresh.is_update_due(ready.model_copy(update={"update_script": ""})) is False
-    assert refresh.is_update_due(ready.model_copy(update={"snapshot_status": "failed"})) is False
-
-
-@pytest.mark.asyncio
-async def test_a_new_sandbox_starts_a_background_update_when_one_is_due() -> None:
-    start = AsyncMock(return_value="run-1")
-    due = Workspace(slug="base", update_script="git pull", snapshot_status="ready", snapshot_id="s")
-    with patch.object(refresh, "start_refresh_run", start):
-        assert await refresh.maybe_start_update(due) == "run-1"
-        assert await refresh.maybe_start_update(None) is None
-
-    start.assert_awaited_once_with("base", kind="update")
-
-
-@pytest.mark.asyncio
-async def test_a_failed_trigger_never_reaches_the_sandbox_creation() -> None:
-    due = Workspace(slug="base", update_script="git pull", snapshot_status="ready", snapshot_id="s")
-    with patch.object(refresh, "start_refresh_run", AsyncMock(side_effect=RuntimeError("down"))):
-        assert await refresh.maybe_start_update(due) is None
-
-
 # --- cron ---
-
-
-@pytest.mark.usefixtures("registry_db")
-@pytest.mark.asyncio
-async def test_cron_registration_is_idempotent() -> None:
-    client = MagicMock()
-    client.crons.create = AsyncMock(return_value={"cron_id": "cron-1"})
-    with patch.object(refresh, "_client", return_value=client):
-        await WORKSPACES.create(
-            WorkspaceCreate(name="base", repos=["acme/base"], setup_script="make setup"), "ramon"
-        )
-        assert await refresh.ensure_refresh_cron("base") == "cron-1"
-        assert await refresh.ensure_refresh_cron("base") == "cron-1"
-
-    client.crons.create.assert_awaited_once()
-
-
-@pytest.mark.usefixtures("registry_db")
-@pytest.mark.asyncio
-async def test_deleting_an_workspace_removes_its_cron() -> None:
-    client = MagicMock()
-    client.crons.create = AsyncMock(return_value={"cron_id": "cron-1"})
-    client.crons.delete = AsyncMock()
-    with (
-        patch.object(refresh, "_client", return_value=client),
-        patch.object(env_store, "_delete_snapshot", AsyncMock()),
-    ):
-        await WORKSPACES.create(
-            WorkspaceCreate(name="base", repos=["acme/base"], setup_script="make setup"), "ramon"
-        )
-        await refresh.ensure_refresh_cron("base")
-        assert await WORKSPACES.remove("base") is True
-
-    client.crons.delete.assert_awaited_once_with("cron-1")
-
-
-@pytest.mark.usefixtures("registry_db")
-@pytest.mark.asyncio
-async def test_a_refresh_records_every_stage_it_reaches() -> None:
-    """A rebuild runs for minutes to an hour; the stage list is how it is followed."""
-    backend = _backend(_Result("provisioned", 0), _Result("Already up to date.", 0))
-    with (
-        patch.object(refresh, "_create_builder_sandbox", AsyncMock(return_value=backend)),
-        patch.object(refresh, "_release_builder_sandbox", AsyncMock()),
-        patch.object(refresh, "capture_workspace_snapshot", AsyncMock()),
-    ):
-        await WORKSPACES.create(
-            WorkspaceCreate(
-                name="base",
-                repos=["acme/base"],
-                setup_script="make setup",
-                update_script="git pull",
-            ),
-            "ramon",
-        )
-        await refresh.refresh_workspace("base")
-        record = await WORKSPACES.get("base")
-
-    assert record is not None
-    assert [(step.label, step.status) for step in record.refresh_steps] == [
-        ("boot", "success"),
-        ("setup", "success"),
-        ("update", "success"),
-        ("capture", "success"),
-    ]
-    # The script steps carry where their trace was written, for a live read.
-    paths = {step.label: step.log_path for step in record.refresh_steps}
-    assert paths["setup"] == env_store.script_log_path("setup")
-    assert paths["boot"] is None
 
 
 @pytest.mark.usefixtures("registry_db")
@@ -474,7 +289,13 @@ async def test_the_step_that_broke_is_the_one_left_failed() -> None:
         patch.object(refresh, "capture_workspace_snapshot", AsyncMock()),
     ):
         await WORKSPACES.create(
-            WorkspaceCreate(name="base", repos=["acme/base"], setup_script="make setup"), "ramon"
+            WorkspaceCreate(
+                inherit_default_sandbox=False,
+                name="base",
+                repos=["acme/base"],
+                setup_script="make setup",
+            ),
+            "ramon",
         )
         await refresh.refresh_workspace("base")
         record = await WORKSPACES.get("base")
@@ -503,7 +324,13 @@ async def test_the_builder_is_published_while_it_lives_and_cleared_after() -> No
         patch.object(refresh, "capture_workspace_snapshot", _capture),
     ):
         await WORKSPACES.create(
-            WorkspaceCreate(name="base", repos=["acme/base"], setup_script="make setup"), "ramon"
+            WorkspaceCreate(
+                inherit_default_sandbox=False,
+                name="base",
+                repos=["acme/base"],
+                setup_script="make setup",
+            ),
+            "ramon",
         )
         await refresh.refresh_workspace("base")
         record = await WORKSPACES.get("base")

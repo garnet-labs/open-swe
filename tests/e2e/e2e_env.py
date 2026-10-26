@@ -30,10 +30,16 @@ SECOND_PR_TITLE = "Add companion integration"
 BOT_USER_ID = "U0BOT"
 BOT_USERNAME = "open-swe"
 DEMO_CHANNEL = "C_DEMO"
+# Shaped like a real channel id, so a repository's `reviewChannel` resolves without a name search.
+REVIEW_CHANNEL = "CREVIEWS01"
 HUMAN_USER = "U_HUMAN"
+# A Slack account with no Open SWE side: never signed in, never linked.
+UNLINKED_USER = "U_CAROL"
 
 PORT = os.environ.setdefault("E2E_PORT", "2024")
 BASE_URL = os.environ.setdefault("E2E_BASE", f"http://127.0.0.1:{PORT}")
+# The Managed Deep Agents server (mda-dev.sh) every Open SWE thread runs on.
+MDA_PORT = os.environ.setdefault("E2E_MDA_PORT", "2025")
 
 # Where a browser reaches the dashboard: the app's own server, not this harness.
 # It is a separate origin from the backend here only because the two run as
@@ -66,6 +72,7 @@ _DEFAULTS = {
     # Webhook signing + bot identity.
     "GITHUB_WEBHOOK_SECRET": "test-github-secret",
     "SLACK_SIGNING_SECRET": "test-slack-secret",
+    "RUN_COMPLETE_WEBHOOK_SECRET": "test-run-complete-secret",
     "SLACK_BOT_TOKEN": "xoxb-test-token",
     "SLACK_BOT_USER_ID": BOT_USER_ID,
     "SLACK_BOT_USERNAME": BOT_USERNAME,
@@ -80,6 +87,8 @@ _DEFAULTS = {
     "LANGSMITH_CONTROL_PLANE_API_KEY": "",
     # SDK client target (same dev server).
     "LANGGRAPH_URL": BASE_URL,
+    "MDA_RUNTIME_URL": f"http://127.0.0.1:{MDA_PORT}",
+    "REMOTE_RUNTIME_TOKEN_SECRET": "test-remote-runtime-token-secret",
     # Dashboard: the "Open in Web" link target + session-cookie signing. Use
     # 127.0.0.1 (not localhost) so the local-dev LLM-key check stays skipped.
     # The link points at the app server, so following it lands the browser on
@@ -87,7 +96,11 @@ _DEFAULTS = {
     "DASHBOARD_BASE_URL": APP_URL,
     "DASHBOARD_API_BASE_URL": BASE_URL,
     "DASHBOARD_ALLOWED_ORIGINS": f"{APP_URL},{BASE_URL},open-swe://app",
-    "DASHBOARD_JWT_SECRET": "test-dashboard-jwt-secret",
+    # At least 32 bytes: a shorter key makes PyJWT warn on every session decode
+    # from a worker thread, which holds the warnings lock while logging. The dev
+    # log renderer warns from inside its handler, so the two lock orders cross
+    # and deadlock the backend's event loop for the rest of the shard.
+    "DASHBOARD_JWT_SECRET": "test-dashboard-jwt-secret-for-e2e-sessions",
 }
 
 # Named test users (the Slack sender dropdown + the dashboard login picker, and
@@ -112,13 +125,27 @@ TEST_USERS = [
         "email": "bob@example.com",
         "github_id": "1002",
     },
+    {
+        "name": "Dana",
+        "slack_id": "U_DANA",
+        "login": "dana",
+        "email": "dana@example.com",
+        "github_id": "1005",
+    },
 ]
 
 # Alice is the workspace admin (so admin threads + the workspaces dashboard are
 # reachable); Bob is a plain member, which is what the deny-side assertions use.
 ADMIN_USER = TEST_USERS[0]
 _DEFAULTS["ALLOWED_GITHUB_USERS"] = ",".join(
-    [*(user["login"] for user in TEST_USERS), "thread-tools-e2e", "threads-workspace-e2e"]
+    [
+        *(user["login"] for user in TEST_USERS),
+        "carol",
+        "octocat",
+        "thread-tools-e2e",
+        "threads-workspace-e2e",
+        "workspace-default-onboarding-e2e",
+    ]
 )
 _DEFAULTS["CONFIGURED_ADMINS"] = ADMIN_USER["email"]
 

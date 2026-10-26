@@ -6,7 +6,10 @@ import {
   type Page,
 } from "@playwright/test";
 
-import { dismissOnboardingIfShown } from "./helpers/dashboard";
+import {
+  dismissOnboardingIfShown,
+  waitForThreadIdle,
+} from "./helpers/dashboard";
 
 const USER = {
   login: "threads-workspace-e2e",
@@ -28,8 +31,8 @@ const THREAD_IDS = {
   dailyScheduled: "73000000-0000-4000-8000-000000000001",
   dailyTest: "73000000-0000-4000-8000-000000000002",
   weeklyRunning: "73000000-0000-4000-8000-000000000003",
-  noProject: "74000000-0000-4000-8000-000000000001",
-  pinnedProject: "74000000-0000-4000-8000-000000000002",
+  noRepo: "74000000-0000-4000-8000-000000000001",
+  pinnedRepo: "74000000-0000-4000-8000-000000000002",
 } as const;
 
 const TITLES = {
@@ -43,14 +46,12 @@ const TITLES = {
   dailyScheduled: "E2E Workspace Daily health scheduled run",
   dailyTest: "E2E Workspace Daily health test run",
   weeklyRunning: "E2E Workspace Weekly cleanup running",
-  noProject: "E2E Workspace No project chat",
-  pinnedProject: "E2E Workspace Pinned project chat",
+  noRepo: "E2E Workspace No repository chat",
+  pinnedRepo: "E2E Workspace Pinned repository chat",
 } as const;
 
-const SCHEDULE_IDS = {
-  daily: "e2e-daily-health",
-  weekly: "e2e-weekly-cleanup",
-} as const;
+// Filled in by seedSchedules: the dashboard API assigns automation ids.
+const SCHEDULE_IDS = { daily: "", weekly: "" };
 
 interface ThreadSeed {
   id: string;
@@ -291,90 +292,73 @@ async function seedThreads(
 }
 
 async function seedSchedules(request: APIRequestContext) {
-  const now = new Date().toISOString();
+  const login = await request.post("/control/login", { data: ADMIN_USER });
+  expect(login.ok(), await login.text()).toBeTruthy();
   const schedules = [
     {
-      id: SCHEDULE_IDS.daily,
-      name: "E2E Daily Health",
-      prompt: "Check repository health.",
-      schedule: "0 9 * * 1-5",
-      repo: null,
-      slack_channel_id: null,
-      slack_notification_mode: "always",
-      model: null,
-      effort: null,
+      key: "daily" as const,
+      body: {
+        workspace: "default",
+        name: "E2E Daily Health",
+        prompt: "Check repository health.",
+        triggers: [{ kind: "schedule", cron: "0 9 * * 1-5" }],
+      },
       enabled: true,
-      cron_id: "e2e-cron-daily-health",
-      created_by: USER.login,
-      user_email: USER.email,
-      created_at: now,
-      updated_at: now,
     },
     {
-      id: SCHEDULE_IDS.weekly,
-      name: "E2E Weekly Cleanup",
-      prompt: "Clean up stale work.",
-      schedule: "0 10 * * 1",
-      repo: { owner: "acme", name: "beta" },
-      slack_channel_id: null,
-      slack_notification_mode: "on_action",
-      model: null,
-      effort: null,
+      key: "weekly" as const,
+      body: {
+        workspace: "default",
+        name: "E2E Weekly Cleanup",
+        prompt: "Clean up stale work.",
+        triggers: [{ kind: "schedule", cron: "0 10 * * 1" }],
+      },
       enabled: false,
-      cron_id: "e2e-cron-weekly-cleanup",
-      created_by: USER.login,
-      user_email: USER.email,
-      created_at: now,
-      updated_at: now,
     },
   ];
 
   for (const schedule of schedules) {
-    const response = await request.put("/store/items", {
-      data: {
-        namespace: ["agent_schedules"],
-        key: schedule.id,
-        value: schedule,
-      },
+    const response = await request.post("/dashboard/api/schedules", {
+      data: schedule.body,
+      headers: SAME_ORIGIN_HEADERS,
     });
     expect(response.ok(), await response.text()).toBeTruthy();
-    createdScheduleIds.add(schedule.id);
-  }
-}
-
-async function deleteScheduleThreads(
-  request: APIRequestContext,
-  scheduleId: string,
-) {
-  for (;;) {
-    const searchResponse = await request.post("/threads/search", {
-      data: { metadata: { schedule_id: scheduleId }, limit: 100, offset: 0 },
-    });
-    expect(searchResponse.ok(), await searchResponse.text()).toBeTruthy();
-    const threads = (await searchResponse.json()) as Array<{
-      thread_id: string;
-    }>;
-    if (threads.length === 0) return;
-    for (const thread of threads) {
-      const response = await request.delete(`/threads/${thread.thread_id}`);
-      expect([200, 204, 404]).toContain(response.status());
+    const { id } = (await response.json()) as { id: string };
+    SCHEDULE_IDS[schedule.key] = id;
+    createdScheduleIds.add(id);
+    if (!schedule.enabled) {
+      const paused = await request.patch(`/dashboard/api/schedules/${id}`, {
+        data: { enabled: false },
+        headers: SAME_ORIGIN_HEADERS,
+      });
+      expect(paused.ok(), await paused.text()).toBeTruthy();
     }
   }
 }
 
 async function cleanupFixtures(request: APIRequestContext) {
+  if (createdThreadIds.size > 0) {
+    const login = await request.post("/control/login", { data: USER });
+    expect(login.ok(), await login.text()).toBeTruthy();
+  }
   for (const threadId of createdThreadIds) {
-    const pinResponse = await request.delete("/store/items", {
-      data: { namespace: ["thread_pins", USER.login], key: threadId },
-    });
+    const pinResponse = await request.delete(
+      `/dashboard/api/threads/${threadId}/pin`,
+      { headers: SAME_ORIGIN_HEADERS },
+    );
     expect([200, 204, 404]).toContain(pinResponse.status());
     const response = await request.delete(`/threads/${threadId}`);
     expect([200, 204, 404]).toContain(response.status());
   }
+  if (createdScheduleIds.size > 0) {
+    const login = await request.post("/control/login", { data: ADMIN_USER });
+    expect(login.ok(), await login.text()).toBeTruthy();
+  }
   for (const scheduleId of createdScheduleIds) {
-    const response = await request.delete("/store/items", {
-      data: { namespace: ["agent_schedules"], key: scheduleId },
-    });
+    const response = await request.delete(
+      `/dashboard/api/schedules/${scheduleId}`,
+      { headers: SAME_ORIGIN_HEADERS },
+    );
     expect([200, 204, 404]).toContain(response.status());
   }
   createdThreadIds.clear();
@@ -458,6 +442,17 @@ test.describe("threads workspace", () => {
       },
     ]);
     await loginAs(page);
+    await page.route("**/dashboard/api/me", async (route) => {
+      const response = await route.fetch();
+      const session = (await response.json()) as Record<string, unknown>;
+      await route.fulfill({
+        json: {
+          ...session,
+          slack_oauth_enabled: true,
+          slack_user_id: null,
+        },
+      });
+    });
 
     const profileGate = deferred();
     const profileStarted = deferred();
@@ -481,17 +476,17 @@ test.describe("threads workspace", () => {
     );
 
     await page.goto("/agents");
+    await profileStarted.promise;
     await expect(
       page.getByRole("heading", { name: "What should we build?" }),
     ).toBeVisible();
-    await profileStarted.promise;
 
     await page.evaluate(() => {
       const seen = { value: false };
       (window as unknown as Record<string, unknown>).__newThreadDialogSeen =
         seen;
       const detect = () => {
-        if (document.body.textContent?.includes("Choose your default model")) {
+        if (document.body.textContent?.includes("Connect your Slack account")) {
           seen.value = true;
         }
       };
@@ -527,7 +522,7 @@ test.describe("threads workspace", () => {
     expect(flashed).toBe(false);
   });
 
-  test("shows a recency-sorted project list in the sidebar", async ({
+  test("shows a recency-sorted repository list in the sidebar", async ({
     page,
     request,
   }, testInfo) => {
@@ -541,7 +536,7 @@ test.describe("threads workspace", () => {
     await dismissOnboardingIfShown(page);
 
     const sidebar = page.locator("[data-sidebar-frame]");
-    await sidebar.getByRole("button", { name: "Projects options" }).click();
+    await sidebar.getByRole("button", { name: "Repositories options" }).click();
     await page
       .getByRole("menuitemradio", { name: "Last updated", exact: true })
       .click();
@@ -580,7 +575,7 @@ test.describe("threads workspace", () => {
       0,
     );
 
-    // Collapsing a project hides only that project's threads.
+    // Collapsing a repository hides only that repository's threads.
     await betaGroup.click();
     await expect(betaGroup).toHaveAttribute("aria-expanded", "false");
     await expect(workspaceLinks).toHaveCount(4);
@@ -590,7 +585,7 @@ test.describe("threads workspace", () => {
     await betaGroup.click();
     await expect(workspaceLinks).toHaveCount(5);
 
-    await sidebar.getByRole("button", { name: "Projects options" }).click();
+    await sidebar.getByRole("button", { name: "Repositories options" }).click();
     await page
       .getByRole("menuitemcheckbox", { name: "Show archived", exact: true })
       .click();
@@ -622,23 +617,23 @@ test.describe("threads workspace", () => {
     });
   });
 
-  test("groups unprojected chats in a pinnable No project folder", async ({
+  test("groups repository-less chats in a pinnable No repository folder", async ({
     page,
     request,
   }, testInfo) => {
     const now = Date.now();
     await seedThreads(request, [
       {
-        id: THREAD_IDS.noProject,
-        metadata: baseMetadata(now, TITLES.noProject, 1_000, {
+        id: THREAD_IDS.noRepo,
+        metadata: baseMetadata(now, TITLES.noRepo, 1_000, {
           participant_logins: { [ADMIN_USER.login]: true },
           repo_owner: "",
           repo_name: "",
         }),
       },
       {
-        id: THREAD_IDS.pinnedProject,
-        metadata: baseMetadata(now, TITLES.pinnedProject, 2_000, {
+        id: THREAD_IDS.pinnedRepo,
+        metadata: baseMetadata(now, TITLES.pinnedRepo, 2_000, {
           participant_logins: { [ADMIN_USER.login]: true },
         }),
       },
@@ -652,14 +647,14 @@ test.describe("threads workspace", () => {
     await dismissOnboardingIfShown(page);
 
     const sidebar = page.locator("[data-sidebar-frame]");
-    const noProject = sidebar.getByRole("button", {
-      name: "No project",
+    const noRepo = sidebar.getByRole("button", {
+      name: "No repository",
       exact: true,
     });
-    await expect(noProject).toBeVisible();
-    await expect(sidebar).toContainText(TITLES.noProject);
+    await expect(noRepo).toBeVisible();
+    await expect(sidebar).toContainText(TITLES.noRepo);
 
-    await sidebar.getByRole("button", { name: "Projects options" }).click();
+    await sidebar.getByRole("button", { name: "Repositories options" }).click();
     await expect(
       page.getByRole("menuitemradio", { name: "Created", exact: true }),
     ).toBeChecked();
@@ -671,30 +666,35 @@ test.describe("threads workspace", () => {
     });
     await page.keyboard.press("Escape");
 
-    const pinNoProject = sidebar.getByRole("button", {
-      name: "Pin No project",
+    const pinNoRepo = sidebar.getByRole("button", {
+      name: "Pin No repository",
       includeHidden: true,
     });
-    await pinNoProject.locator("..").hover();
-    await pinNoProject.click();
+    // Rows seeded by earlier tests can still shift the folder after the hover lands.
+    await expect(async () => {
+      await pinNoRepo.locator("..").hover();
+      await pinNoRepo.click({ timeout: 2_000 });
+    }).toPass();
     await expect(sidebar.getByText("Pinned", { exact: true })).toBeVisible();
     await expect(
-      sidebar.getByRole("button", { name: "No project", exact: true }),
+      sidebar.getByRole("button", { name: "No repository", exact: true }),
     ).toBeVisible();
 
     await page.reload();
     await dismissOnboardingIfShown(page);
-    await expect(sidebar).toContainText(TITLES.noProject);
-    const unpinNoProject = sidebar.getByRole("button", {
-      name: "Unpin No project",
+    await expect(sidebar).toContainText(TITLES.noRepo);
+    const unpinNoRepo = sidebar.getByRole("button", {
+      name: "Unpin No repository",
       includeHidden: true,
     });
-    await unpinNoProject.locator("..").hover();
-    await expect(unpinNoProject).toBeVisible();
+    await expect(async () => {
+      await unpinNoRepo.locator("..").hover();
+      await expect(unpinNoRepo).toBeVisible({ timeout: 2_000 });
+    }).toPass();
 
-    const screenshotPath = testInfo.outputPath("pinned-no-project.png");
+    const screenshotPath = testInfo.outputPath("pinned-no-repository.png");
     await sidebar.screenshot({ path: screenshotPath });
-    await testInfo.attach("pinned-no-project", {
+    await testInfo.attach("pinned-no-repository", {
       path: screenshotPath,
       contentType: "image/png",
     });
@@ -706,10 +706,8 @@ test.describe("automation run history", () => {
     page,
     request,
   }) => {
-    await deleteScheduleThreads(request, SCHEDULE_IDS.daily);
-    await deleteScheduleThreads(request, SCHEDULE_IDS.weekly);
-    await seedThreads(request, [...workspaceThreads(), ...automationThreads()]);
     await seedSchedules(request);
+    await seedThreads(request, [...workspaceThreads(), ...automationThreads()]);
     const loginResponse = await page.request.post("/control/login", {
       data: ADMIN_USER,
     });
@@ -727,6 +725,7 @@ test.describe("automation run history", () => {
     };
     expect(triggered.status).toBe("started");
     createdThreadIds.add(triggered.thread_id);
+    await waitForThreadIdle(page, triggered.thread_id);
 
     const producedHistoryResponse = await page.request.get(
       `/dashboard/api/threads/page?scope=automation&automation_id=${SCHEDULE_IDS.daily}&limit=100&offset=0`,
@@ -746,7 +745,7 @@ test.describe("automation run history", () => {
     expect(producedHistory.items).toContainEqual(
       expect.objectContaining({
         id: triggered.thread_id,
-        title: "Test: E2E Daily Health",
+        title: "Add greet() helper",
         triggerKind: "schedule_test",
         automationId: SCHEDULE_IDS.daily,
       }),
@@ -797,7 +796,7 @@ test.describe("automation run history", () => {
     const producedRun = daily.locator(
       `a[href="/agents/${triggered.thread_id}"]`,
     );
-    await expect(producedRun).toContainText("Test: E2E Daily Health");
+    await expect(producedRun).toContainText("Add greet() helper");
     await expect(producedRun).toContainText("Test run");
 
     const scheduledRun = daily.getByRole("link").filter({
@@ -842,7 +841,7 @@ test.describe("automation run history", () => {
     const recentProducedRun = page.locator(
       `a[href="/agents/${triggered.thread_id}"]`,
     );
-    await expect(recentProducedRun).toContainText("Test: E2E Daily Health");
+    await expect(recentProducedRun).toContainText("Add greet() helper");
 
     await recentProducedRun.click();
     await expect(page).toHaveURL(new RegExp(`/agents/${triggered.thread_id}$`));

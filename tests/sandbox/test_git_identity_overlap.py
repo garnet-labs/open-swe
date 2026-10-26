@@ -10,7 +10,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from agent.sandboxes.lifecycle import SandboxCreateConfig, _create_sandbox_with_proxy
+from openswe.github.sandbox_access import SandboxGitHubAccess
+from openswe.sandboxes.lifecycle import SandboxCreateConfig, _create_sandbox_with_proxy
 
 
 def _backend(started: asyncio.Event) -> MagicMock:
@@ -32,7 +33,9 @@ async def test_identity_is_written_while_the_proxy_is_configured() -> None:
 
     with (
         patch(
-            "agent.sandboxes.lifecycle.create_sandbox", new_callable=AsyncMock, return_value=backend
+            "openswe.sandboxes.lifecycle.create_sandbox",
+            new_callable=AsyncMock,
+            return_value=backend,
         ),
         patch.object(
             SandboxCreateConfig,
@@ -41,12 +44,12 @@ async def test_identity_is_written_while_the_proxy_is_configured() -> None:
             return_value=SandboxCreateConfig(snapshot_id="snap"),
         ),
         patch(
-            "agent.sandboxes.lifecycle._resolve_proxy_token",
+            "openswe.sandboxes.lifecycle.workspace_token",
             new_callable=AsyncMock,
-            return_value=("token", None, None),
+            return_value=SandboxGitHubAccess("token"),
         ),
-        patch("agent.sandboxes.lifecycle.configure_github_proxy", side_effect=configure),
-        patch("agent.sandboxes.lifecycle.record_proxy_token_expiry"),
+        patch("openswe.sandboxes.lifecycle.configure_sandbox_proxy", side_effect=configure),
+        patch("openswe.sandboxes.lifecycle.record_proxy_token_expiry"),
     ):
         assert await _create_sandbox_with_proxy(thread_id="thread-overlap") is backend
 
@@ -61,7 +64,9 @@ async def test_identity_failure_fails_the_sandbox() -> None:
 
     with (
         patch(
-            "agent.sandboxes.lifecycle.create_sandbox", new_callable=AsyncMock, return_value=backend
+            "openswe.sandboxes.lifecycle.create_sandbox",
+            new_callable=AsyncMock,
+            return_value=backend,
         ),
         patch.object(
             SandboxCreateConfig,
@@ -70,12 +75,12 @@ async def test_identity_failure_fails_the_sandbox() -> None:
             return_value=SandboxCreateConfig(snapshot_id="snap"),
         ),
         patch(
-            "agent.sandboxes.lifecycle._resolve_proxy_token",
+            "openswe.sandboxes.lifecycle.workspace_token",
             new_callable=AsyncMock,
-            return_value=("token", None, None),
+            return_value=SandboxGitHubAccess("token"),
         ),
-        patch("agent.sandboxes.lifecycle.configure_github_proxy", new_callable=AsyncMock),
-        patch("agent.sandboxes.lifecycle.record_proxy_token_expiry"),
+        patch("openswe.sandboxes.lifecycle.configure_sandbox_proxy", new_callable=AsyncMock),
+        patch("openswe.sandboxes.lifecycle.record_proxy_token_expiry"),
         pytest.raises(RuntimeError, match="identity failed"),
     ):
         await _create_sandbox_with_proxy(thread_id="thread-identity-fails")
@@ -93,7 +98,9 @@ async def test_a_failed_proxy_does_not_leave_the_identity_write_running() -> Non
 
     with (
         patch(
-            "agent.sandboxes.lifecycle.create_sandbox", new_callable=AsyncMock, return_value=backend
+            "openswe.sandboxes.lifecycle.create_sandbox",
+            new_callable=AsyncMock,
+            return_value=backend,
         ),
         patch.object(
             SandboxCreateConfig,
@@ -102,16 +109,16 @@ async def test_a_failed_proxy_does_not_leave_the_identity_write_running() -> Non
             return_value=SandboxCreateConfig(snapshot_id="snap"),
         ),
         patch(
-            "agent.sandboxes.lifecycle._resolve_proxy_token",
+            "openswe.sandboxes.lifecycle.workspace_token",
             new_callable=AsyncMock,
-            return_value=("token", None, None),
+            return_value=SandboxGitHubAccess("token"),
         ),
         patch(
-            "agent.sandboxes.lifecycle.configure_github_proxy",
+            "openswe.sandboxes.lifecycle.configure_sandbox_proxy",
             new_callable=AsyncMock,
             side_effect=RuntimeError("proxy failed"),
         ),
-        patch("agent.sandboxes.lifecycle.record_proxy_token_expiry"),
+        patch("openswe.sandboxes.lifecycle.record_proxy_token_expiry"),
         pytest.raises(RuntimeError, match="proxy failed"),
     ):
         await _create_sandbox_with_proxy(thread_id="thread-proxy-fails")
@@ -119,3 +126,32 @@ async def test_a_failed_proxy_does_not_leave_the_identity_write_running() -> Non
     # Cancelled with the sandbox, rather than left behind to report into a run
     # that has already given up on the box.
     assert not release.is_set()
+
+
+@pytest.mark.asyncio
+async def test_proxy_token_is_minted_while_the_sandbox_boots() -> None:
+    minting = asyncio.Event()
+    backend = MagicMock(id="sandbox-new", aexecute=AsyncMock(return_value="ok"))
+
+    async def boot(*_args: object, **_kwargs: object) -> MagicMock:
+        # A token minted only after boot returns would never set this.
+        await asyncio.wait_for(minting.wait(), timeout=2)
+        return backend
+
+    async def mint(*_args: object, **_kwargs: object) -> SandboxGitHubAccess:
+        minting.set()
+        return SandboxGitHubAccess("token")
+
+    with (
+        patch("openswe.sandboxes.lifecycle.create_sandbox", side_effect=boot),
+        patch.object(
+            SandboxCreateConfig,
+            "resolve",
+            new_callable=AsyncMock,
+            return_value=SandboxCreateConfig(snapshot_id="snap"),
+        ),
+        patch("openswe.sandboxes.lifecycle.workspace_token", side_effect=mint),
+        patch("openswe.sandboxes.lifecycle.configure_sandbox_proxy", new_callable=AsyncMock),
+        patch("openswe.sandboxes.lifecycle.record_proxy_token_expiry"),
+    ):
+        assert await _create_sandbox_with_proxy(thread_id="thread-token-overlap") is backend

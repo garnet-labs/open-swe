@@ -13,8 +13,8 @@ for command in node ditto; do
   }
 done
 
-command -v uv >/dev/null || {
-  echo "Missing uv. Install it from https://docs.astral.sh/uv/, then try again." >&2
+command -v bun >/dev/null || {
+  echo "Missing bun. Install it from https://bun.com/docs/installation, then try again." >&2
   exit 1
 }
 

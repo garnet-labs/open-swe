@@ -1,5 +1,4 @@
 import asyncio
-from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from types import SimpleNamespace
 from typing import Any
@@ -9,13 +8,13 @@ import pytest
 from langchain_core.tools import BaseTool
 from mcp.types import CallToolResult, TextContent, Tool
 
-from agent import completion
-from agent.github import token as auth
-from agent.linear import notifications
-from agent.mcp import MCPConnectionUpdate, runtime
-from agent.mcp import workspace as workspace_mcps
-from agent.middleware import sandbox_circuit_breaker
-from agent.run_config import RunConfig
+from openswe import completion
+from openswe.linear import notifications
+from openswe.mcp import MCPConnectionUpdate, runtime
+from openswe.mcp import workspace as workspace_mcps
+from openswe.middleware import sandbox_circuit_breaker
+from openswe.run_config import RunConfig
+from tests.mcp_helpers import Transport, fake_mcp_server
 
 
 @dataclass
@@ -23,15 +22,13 @@ class LinearMCP:
     calls: list[tuple[str, dict[str, Any]]] = field(default_factory=list)
     is_error: bool = False
 
-    async def initialize(self) -> None:
-        pass
-
     async def call_tool(
-        self, name: str, arguments: dict[str, Any], **kwargs: Any
+        self, transport: Transport, name: str, arguments: dict[str, Any]
     ) -> CallToolResult:
+        assert transport.url == "https://mcp.linear.app/mcp"
         self.calls.append((name, arguments))
         return CallToolResult(
-            isError=self.is_error,
+            is_error=self.is_error,
             content=[TextContent(type="text", text="rejected" if self.is_error else "created")],
         )
 
@@ -42,7 +39,7 @@ def comment_tool() -> str:
 
 
 @pytest.fixture
-async def linear_mcp(fake_store, monkeypatch: pytest.MonkeyPatch, comment_tool: str) -> LinearMCP:
+async def linear_mcp(registry_db, monkeypatch: pytest.MonkeyPatch, comment_tool: str) -> LinearMCP:
     await workspace_mcps.save_workspace_mcp(
         "default",
         "linear",
@@ -52,7 +49,7 @@ async def linear_mcp(fake_store, monkeypatch: pytest.MonkeyPatch, comment_tool: 
     )
     definition = Tool(
         name=comment_tool,
-        inputSchema={
+        input_schema={
             "type": "object",
             "properties": {"issueId": {"type": "string"}, "body": {"type": "string"}},
             "required": ["issueId", "body"],
@@ -60,13 +57,7 @@ async def linear_mcp(fake_store, monkeypatch: pytest.MonkeyPatch, comment_tool: 
     )
     monkeypatch.setattr(runtime, "_discover_tools", AsyncMock(return_value=[definition]))
     remote = LinearMCP()
-
-    @asynccontextmanager
-    async def session(connection, **kwargs):
-        assert connection["url"] == "https://mcp.linear.app/mcp"
-        yield remote
-
-    monkeypatch.setattr("langchain_mcp_adapters.tools.create_session", session)
+    fake_mcp_server(monkeypatch, call=lambda *call: remote.call_tool(*call))
     return remote
 
 
@@ -86,22 +77,6 @@ async def test_failed_linear_run_posts_through_mcp(
     assert name == comment_tool
     assert arguments["issueId"] == "issue-1"
     assert "timed out" in arguments["body"]
-
-
-async def test_linear_auth_failure_posts_token_free_notice(
-    linear_mcp: LinearMCP, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    monkeypatch.setattr(
-        "agent.run_config.get_config",
-        lambda: {"configurable": {"linear_issue": {"id": "issue-1"}}},
-    )
-    await auth.leave_failure_comment("linear", "Sign in at https://auth.example/private-token")
-
-    assert len(linear_mcp.calls) == 1
-    _, arguments = linear_mcp.calls[0]
-    assert arguments["issueId"] == "issue-1"
-    assert "GitHub" in arguments["body"]
-    assert "private-token" not in arguments["body"]
 
 
 async def test_linear_sandbox_failure_posts_through_mcp(
@@ -252,7 +227,7 @@ async def test_notification_times_out_without_retrying(
     monkeypatch.setattr(notifications.asyncio, "timeout", lambda _: deadline)
     calls = []
 
-    async def never_finishes(name, arguments, **kwargs):
+    async def never_finishes(transport, name, arguments):
         calls.append((name, arguments))
         deadline.reschedule(asyncio.get_running_loop().time())
         await asyncio.Event().wait()

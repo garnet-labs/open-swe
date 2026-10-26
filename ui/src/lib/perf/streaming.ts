@@ -69,14 +69,11 @@ subscribeRequestTimings((timing) => {
 export class RunTracker {
   state: RunState | null = null
   threadId: string | null
-  private readonly transport: "cloud" | "local"
 
   constructor(options: {
-    transport: "cloud" | "local"
     /** `null` until a lazily created thread has an id; see `bindThread`. */
     threadId: string | null
   }) {
-    this.transport = options.transport
     this.threadId = options.threadId?.toLowerCase() ?? null
   }
 
@@ -85,7 +82,7 @@ export class RunTracker {
       this.state.span.abandon("superseded")
     }
     this.state = {
-      span: startSpan("agent_run", { transport: this.transport, ...extra }),
+      span: startSpan("agent_run", extra),
       events: 0,
       textDeltas: 0,
       lagSum: 0,
@@ -160,6 +157,25 @@ export class RunTracker {
     if (!isRecord(delta) || delta["type"] !== "text-delta") return
     const text = delta["text"]
     if (typeof text !== "string" || !text) return
+    state.textDeltas += 1
+    state.span.mark("first_text")
+  }
+
+  /**
+   * A transcript-log event reached the browser. `opensRun` starts a span for a
+   * run this client did not submit (a queued message, another tab, Slack);
+   * `text` counts a streamed prose flush.
+   */
+  transcriptEvent(options: { opensRun?: boolean; text?: boolean }): void {
+    if (options.opensRun && (!this.state || this.state.span.ended)) {
+      this.begin({ joined: true })
+      this.state?.span.mark("accepted")
+    }
+    const state = this.state
+    if (!state || state.span.ended) return
+    state.events += 1
+    state.span.mark("first_event")
+    if (!options.text) return
     state.textDeltas += 1
     state.span.mark("first_text")
   }

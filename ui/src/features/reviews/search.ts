@@ -1,3 +1,5 @@
+import { parseScrollAnchor } from "./lib/scrollAnchor"
+
 export type ReviewSort = "updatedAt" | "createdAt"
 export const reviewStatuses = [
   "Draft",
@@ -10,13 +12,47 @@ export const reviewStatuses = [
 ] as const
 export type ReviewStatus = (typeof reviewStatuses)[number]
 export interface ReviewsSearch {
-  tab?: "mine" | "all"
+  tab?: "mine" | "to-review" | "all"
+  github?: boolean
   repo?: string[]
   q?: string
   status?: ReviewStatus[]
   sort?: ReviewSort
   direction?: "asc" | "desc"
   page?: number
+  // The open pull request, as `owner/repo#number` — the same shape as
+  // `pullRequestKey`, so a row can put its own key straight into the URL.
+  pr?: string
+  /** Files expanded in the open pull request's preview. */
+  files?: string[]
+  /** The preview's scroll position, as `formatScrollAnchor` writes it. */
+  at?: string
+}
+
+const prSelectionPattern = /^[\w.-]+\/[\w.-]+#\d+$/
+
+export function parsePullRequestSelection(
+  value: string | undefined
+): { owner: string; repo: string; number: number } | null {
+  if (!value || !prSelectionPattern.test(value)) return null
+  const [fullName, rawNumber] = value.split("#")
+  const [owner, repo] = fullName!.split("/")
+  return { owner: owner!, repo: repo!, number: Number(rawNumber) }
+}
+
+const pullRequestUrlPattern =
+  /github\.com\/([\w.-]+)\/([\w.-]+)\/pulls?\/(\d+)/i
+const pullRequestRefPattern = /([\w.-]+)\/([\w.-]+)#(\d+)/
+
+/** The pull request a pasted GitHub URL or `owner/repo#number` names, ignoring surrounding text. */
+export function parsePullRequestReference(
+  text: string
+): { owner: string; repo: string; number: number } | null {
+  const match =
+    pullRequestUrlPattern.exec(text) ?? pullRequestRefPattern.exec(text)
+  if (!match) return null
+  const [, owner, repo, rawNumber] = match
+  return { owner: owner!, repo: repo!, number: Number(rawNumber) }
 }
 
 export function validateReviewsSearch(
@@ -38,8 +74,19 @@ export function validateReviewsSearch(
       )
     ),
   ]
+  const expandedFiles = (Array.isArray(search.files) ? search.files : [])
+    .filter(
+      (value): value is string =>
+        typeof value === "string" && value.length > 0 && value.length <= 500
+    )
+    .slice(0, 100)
   return {
-    tab: search.tab === "all" ? "all" : undefined,
+    tab:
+      search.tab === "all" || search.tab === "to-review"
+        ? search.tab
+        : undefined,
+    github:
+      search.github === true || search.github === "true" ? true : undefined,
     repo: repo.length ? repo : undefined,
     q: typeof search.q === "string" ? search.q.slice(0, 200) : undefined,
     status: status.length ? status : undefined,
@@ -51,5 +98,16 @@ export function validateReviewsSearch(
         ? search.direction
         : undefined,
     page: Number.isInteger(page) && page > 0 && page <= 50 ? page : undefined,
+    pr:
+      typeof search.pr === "string" && prSelectionPattern.test(search.pr)
+        ? search.pr
+        : undefined,
+    files: expandedFiles.length ? expandedFiles : undefined,
+    at:
+      typeof search.at === "string" &&
+      search.at.length <= 520 &&
+      parseScrollAnchor(search.at)
+        ? search.at
+        : undefined,
   }
 }

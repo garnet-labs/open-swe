@@ -1,23 +1,26 @@
 """Incident runs keep the system-thread runtime and add incident context and tools."""
 
+import json
 from typing import Any, cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from langchain.agents.middleware.types import ModelRequest
 from langchain_core.language_models import BaseChatModel
-from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
+from langchain_core.messages import AIMessage, HumanMessage
 from langchain_core.outputs import ChatGeneration, ChatResult
 from langchain_core.tools import StructuredTool
+from runtime_api.operations import RunOperation, ToolEvidence
 
-from agent.incidents import runtime, service, turns
-from agent.incidents.models import Incident, IncidentPolicy
-from agent.mcp.instance import instance_mcp_source
-from agent.mcp.workspace import workspace_mcp_source
-from agent.slack.channels import SlackChannel
-from agent.workspaces.store import DEFAULT_WORKSPACE_SLUG
+from openswe.incidents import runtime, service, turns
+from openswe.incidents.models import Incident, IncidentPolicy
+from openswe.mcp.instance import instance_mcp_source
+from openswe.mcp.workspace import workspace_mcp_source
+from openswe.middleware.model_call_shape import CallShape
+from openswe.sandboxes.tool_runtime import ToolSurface
+from openswe.slack.channels import SlackChannel
+from openswe.workspaces.store import DEFAULT_WORKSPACE_SLUG
 from tests.agent.test_agent_assembly_context import (
-    _capture_create_deep_agent_kwargs,
+    _plan_agent,
 )
 from tests.agent.test_agent_assembly_context import saved_thread_scope as saved_thread_scope
 
@@ -65,11 +68,11 @@ def _incident_config(**extra: Any) -> dict[str, Any]:
 
 @pytest.mark.parametrize("explicit", [False, True])
 async def test_incident_uses_system_sandbox_tools_integrations_and_delegation(
-    fake_store, monkeypatch, saved_thread_scope, explicit
+    monkeypatch, saved_thread_scope, explicit
 ):
-    from agent.middleware.dynamic_tools import DynamicToolMiddleware
-    from agent.sandboxes.state import SandboxBackendProxy
-    from agent.server import _registered_tool_name
+    from openswe.middleware.dynamic_tools import DynamicToolMiddleware
+    from openswe.sandboxes.state import SandboxBackendProxy
+    from openswe.server import _registered_tool_name
 
     saved_thread_scope.update(source="incidents_agent", owner_type="system", visibility="public")
     session = runtime.IncidentSession(
@@ -87,25 +90,21 @@ async def test_incident_uses_system_sandbox_tools_integrations_and_delegation(
     remote = StructuredTool.from_function(
         coroutine=update_incident, name="incident_update", description="Update incident status"
     )
-    with (
-        patch("agent.server.load_mcp_tools", AsyncMock(return_value=[remote])) as mcps,
-        patch("agent.server._notion_tools_for", AsyncMock(return_value=[])) as notion,
-    ):
-        result = cast(dict[str, Any], await _capture_create_deep_agent_kwargs(_incident_config()))
+    with patch("openswe.server.load_mcp_tools", AsyncMock(return_value=[remote])) as mcps:
+        result = cast(dict[str, Any], await _plan_agent(_incident_config()))
     mcps.assert_awaited_once()
     # System runs load the instance tier and the default workspace's, never a person's.
     assert [source.namespace for source in mcps.await_args.args] == [
         instance_mcp_source().namespace,
         workspace_mcp_source(DEFAULT_WORKSPACE_SLUG).namespace,
     ]
-    notion.assert_awaited_once_with(None)
     assert isinstance(result["backend"].default, SandboxBackendProxy)
     names = {_registered_tool_name(tool) for tool in result["tools"]}
     write_tools = {
         "open_pull_request",
         "http_request",
         "background_execute",
-        "slack_thread_reply",
+        "slack_reply",
         "manage_incident",
     }
     assert {"record_incident_report", "search_incidents"} <= names
@@ -113,8 +112,8 @@ async def test_incident_uses_system_sandbox_tools_integrations_and_delegation(
         assert write_tools <= names
     else:
         assert not write_tools & names
-        from agent.middleware.exclude_tools import ExcludeToolsMiddleware
-        from agent.server import INCIDENT_AUTOMATIC_EXCLUDED_TOOLS
+        from openswe.middleware.exclude_tools import ExcludeToolsMiddleware
+        from openswe.server import INCIDENT_AUTOMATIC_EXCLUDED_TOOLS
 
         excluded = next(
             item for item in result["middleware"] if isinstance(item, ExcludeToolsMiddleware)
@@ -126,42 +125,39 @@ async def test_incident_uses_system_sandbox_tools_integrations_and_delegation(
     assert {
         "PrepareAgentRunMiddleware",
         "IncidentMiddleware",
-        "PullRequestCreationGuardMiddleware",
-        "WorkspaceSkillsMiddleware",
     } <= {type(item).__name__ for item in middleware}
+    surface = cast(ToolSurface, result["surface"])
+    assert "PullRequestCreationGuardMiddleware" in {
+        type(item).__name__ for item in surface.shell_guards
+    }
     dynamic = next(item for item in middleware if isinstance(item, DynamicToolMiddleware))
     assert remote.name in dynamic.tools[0].description
     subagent = result["subagents"][0]
-    subagent_names = {_registered_tool_name(tool) for tool in subagent["tools"]}
-    assert ("open_pull_request" in subagent_names) is explicit
-    assert not (runtime.INCIDENT_TOOL_NAMES | {"manage_incident"}) & subagent_names
-    guard = next(
-        item for item in subagent["middleware"] if isinstance(item, runtime.IncidentMiddleware)
-    )
+    assert subagent.tools is not None
+    assert ("open_pull_request" in subagent.tools) is explicit
+    # Incident tools are the parent's alone.
+    assert not (runtime.INCIDENT_TOOL_NAMES | {"manage_incident"}) & set(subagent.tools)
+    guard = next(item for item in middleware if isinstance(item, runtime.IncidentMiddleware))
     session.check.side_effect = PermissionError("revoked")
-    handler = AsyncMock()
     with pytest.raises(PermissionError, match="revoked"):
-        await guard.awrap_model_call(
-            ModelRequest(model=MagicMock(), messages=[], tools=[], state={"messages": []}), handler
-        )
-    handler.assert_not_awaited()
+        await guard.ashape_model_call(CallShape(), {"messages": []}, MagicMock())
 
 
 async def test_forged_incident_source_on_a_normal_thread_is_refused(saved_thread_scope):
     saved_thread_scope.update(source="slack", visibility="public")
     with pytest.raises(PermissionError, match="not an incident"):
-        await _capture_create_deep_agent_kwargs(_incident_config())
+        await _plan_agent(_incident_config())
 
 
 @pytest.mark.parametrize("requested_action", [False, True])
 async def test_main_agent_records_the_incident_report_through_the_tool(
-    fake_store, monkeypatch, saved_thread_scope, requested_action
+    registry_db, monkeypatch, saved_thread_scope, requested_action
 ):
-    from deepagents import create_deep_agent
-    from langgraph.checkpoint.memory import InMemorySaver
-    from langgraph.store.memory import InMemoryStore
 
-    await service.POLICIES.put("default", IncidentPolicy(enabled=True, workspace_id="T1"))
+    from openswe.agent_api.graph import RunSession
+    from openswe.agent_api.runs import in_graph_context
+
+    await service.POLICIES.put(IncidentPolicy(enabled=True, workspace_id="T1"))
     await service.INCIDENTS.put(
         "incident",
         Incident(id="incident", workspace_id="T1", channel_id="C1", thread_id="thread-ctx"),
@@ -170,93 +166,59 @@ async def test_main_agent_records_the_incident_report_through_the_tool(
         source="incidents_agent", owner_type="system", visibility="public", incident_id="incident"
     )
     monkeypatch.setattr(SlackChannel, "fetch", AsyncMock(return_value=dict(CHANNEL)))
-    posted = AsyncMock(return_value=("9.0", None))
+    posted = AsyncMock(return_value="9.0")
     monkeypatch.setattr(runtime, "post_slack_thread_reply_with_ts", posted)
     config = _incident_config(
         **({"incident_request": "Open a PR for the confirmed fix"} if requested_action else {})
     )
-    kwargs = cast(dict[str, Any], await _capture_create_deep_agent_kwargs(config))
-    kwargs.pop("make_model_calls")
     context = turns.context_block("C1", {"ts": "1.0", "user": "U1", "text": "Errors reported"})
-    performed = AsyncMock(return_value={"url": "https://github.com/acme/api/pull/42"})
-
-    def report_call(evidence_id: str, text: str) -> AIMessage:
-        return AIMessage(
-            content="",
-            tool_calls=[
-                {
-                    "id": "report-call",
-                    "name": "record_incident_report",
-                    "args": {"summary": [{"text": text, "evidence_ids": [evidence_id]}]},
-                }
-            ],
-        )
-
-    class TurnModel(ScriptedModel):
-        async def _agenerate(self, messages, stop=None, run_manager=None, **kwargs):
-            tool_results = [m for m in messages if isinstance(m, ToolMessage)]
-            if any(m.tool_call_id == "report-call" for m in tool_results):
-                reply = AIMessage(content="Recorded.")
-            elif requested_action and not tool_results:
-                reply = AIMessage(
-                    content="",
-                    tool_calls=[{"id": "pr-call", "name": "open_pull_request", "args": {}}],
-                )
-            elif requested_action:
-                observation = next(m for m in tool_results if m.tool_call_id == "pr-call")
-                evidence_id = (
-                    observation.text.rsplit("Incident evidence: ", 1)[1].strip().split("\n", 1)[0]
-                )
-                reply = report_call(evidence_id, "Opened the fix PR")
-            else:
-                reply = report_call("slack:1.0", "Errors reported")
-            return ChatResult(generations=[ChatGeneration(message=reply)])
-
-    if requested_action:
-
-        async def open_pull_request() -> dict:
-            """Open the requested test PR through a simulated external API."""
-            return await performed()
-
-        kwargs["tools"] = [
-            tool
-            for tool in kwargs["tools"]
-            if getattr(tool, "__name__", getattr(tool, "name", "")) != "open_pull_request"
-        ]
-        kwargs["tools"].append(StructuredTool.from_function(coroutine=open_pull_request))
-    model = TurnModel(responses=[])
-    kwargs["model"] = model
-    for subagent in kwargs["subagents"]:
-        subagent["model"] = ScriptedModel(responses=[])
-    kwargs["checkpointer"] = InMemorySaver()
-    kwargs["store"] = InMemoryStore()
-    agent = create_deep_agent(**kwargs)
+    planned = await _plan_agent(config)
+    surface = cast(ToolSurface, planned["surface"])
+    await surface.prepare()
+    session = RunSession(surface, config, None, started_here=True)
+    # The Slack context the model is sent is evidence the report can cite.
+    state: dict[str, object] = {"messages": [HumanMessage(content=context["text"])]}
     with patch(
-        "agent.server.PrepareAgentRunMiddleware._prepare",
-        AsyncMock(
-            return_value={
-                "work_dir": "/workspace",
-                "rendered_system_prompt": "Normal system-thread instructions",
-            }
-        ),
+        "openswe.server.PrepareAgentRunMiddleware._prepare",
+        AsyncMock(return_value={"work_dir": "/workspace", "rendered_system_prompt": "System"}),
     ):
-        result = await agent.ainvoke({"messages": [HumanMessage(content=context["text"])]}, config)
+        await in_graph_context(config, lambda runtime: session.loop.model_call(state, runtime))
+    if requested_action:
+        # The PR the run opened, as its tool result is recorded and cited.
+        cited = await session.record_evidence(
+            ToolEvidence(
+                tool="open_pull_request",
+                content=json.dumps({"url": "https://github.com/acme/api/pull/42"}),
+            )
+        )
+        assert isinstance(cited.content, str)
+        evidence_id = cited.content.rsplit("Incident evidence: ", 1)[1].split("\n", 1)[0]
+        text = "Opened the fix PR"
+    else:
+        evidence_id, text = "slack:1.0", "Errors reported"
 
+    recorded = await session.operation(
+        RunOperation(
+            name="record_incident_report",
+            arguments={"summary": [{"text": text, "evidence_ids": [evidence_id.strip()]}]},
+            request_id="report-call",
+        )
+    )
+
+    assert recorded.status == "success"
     latest = await service.REPORTS.get("incident")
     assert latest is not None
     if requested_action:
-        performed.assert_awaited_once()
         assert "Opened the fix PR" in latest.report.summary
         assert any(
             item.url == "https://github.com/acme/api/pull/42" for item in latest.report.evidence
         )
     else:
-        performed.assert_not_awaited()
         assert latest.report.summary == "Errors reported [slack:1.0]"
     posted.assert_awaited_once()
     assert posted.await_args.args[:2] == ("C1", "0")
-    assert result["messages"][-1].type == "ai"
-    bound = set(model.bound_names)
-    assert {"execute", "record_incident_report", "search_incidents"} <= bound
-    assert ("task" in bound) is requested_action
-    assert ("open_pull_request" in bound) is requested_action
+    catalog = session.catalog()
+    offered = {spec.name for spec in catalog.operations} - set(catalog.excluded)
+    assert {"record_incident_report", "search_incidents"} <= offered
+    assert ("open_pull_request" in offered) is requested_action
+    assert catalog.incident_evidence

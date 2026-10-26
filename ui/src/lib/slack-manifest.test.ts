@@ -38,9 +38,11 @@ describe("slackAppManifest", () => {
           "channel_rename",
           "channel_archive",
           "message.channels",
+          "message.groups",
           "app_mention",
           "message.im",
           "message.mpim",
+          "agent_session_stopped",
         ])
       )
       expect(new Set(events).size).toBe(events.length)
@@ -73,8 +75,8 @@ describe("slackAppManifest", () => {
     expect(manifest.oauth_config.scopes.bot).not.toEqual(
       expect.arrayContaining(CODE_CHANNEL_SCOPES)
     )
-    expect(manifest.settings.event_subscriptions.bot_events).not.toEqual(
-      expect.arrayContaining(CODE_CHANNEL_EVENTS)
+    expect(manifest.settings.event_subscriptions.bot_events).not.toContain(
+      "code_channel_action"
     )
   })
 
